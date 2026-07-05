@@ -8,9 +8,18 @@
 import Cocoa
 import Carbon.HIToolbox
 import ServiceManagement
+import Vision
 
 private let maxThumbWidth: CGFloat = 320
 private let screenMargin: CGFloat = 16
+
+// All captures live here — survives reboots, browsable in Finder.
+private let saveDir: URL = {
+    let d = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("SnapShelf")
+    try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+    return d
+}()
 
 // Hotkeys — edit here, rebuild with build.sh. id 1 = area capture, id 2 = full screen.
 // Two combos per action: ⇧⌘ (matches system screenshot muscle memory) and ⌃⇧ (conflict-free fallback).
@@ -39,13 +48,14 @@ final class ActionButton: NSButton {
 
 // MARK: - Annotations
 
-enum Tool: Int { case pen = 0, arrow, box, text, crop }
+enum Tool: Int { case pen = 0, arrow, box, text, blur, crop }
 
 enum Annotation {
     case pen([NSPoint], NSColor)
     case arrow(NSPoint, NSPoint, NSColor)
     case box(NSRect, NSColor)
     case text(String, NSPoint, NSColor, CGFloat)
+    case blur(NSRect, NSImage)   // rect + prebuilt pixelated tile of that region
 
     func draw(lineWidth lw: CGFloat) {
         switch self {
@@ -88,6 +98,12 @@ enum Annotation {
                 .font: NSFont.boldSystemFont(ofSize: fs),
                 .foregroundColor: c,
             ]).draw(at: pt)
+        case .blur(let r, let tile):
+            let ctx = NSGraphicsContext.current
+            let prev = ctx?.imageInterpolation ?? .default
+            ctx?.imageInterpolation = .none   // hard pixel blocks, no smoothing
+            tile.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1)
+            ctx?.imageInterpolation = prev
         }
     }
 
@@ -98,6 +114,7 @@ enum Annotation {
         case .arrow(let a, let b, let c): return .arrow(t(a), t(b), c)
         case .box(let r, let c): return .box(NSRect(origin: t(r.origin), size: r.size), c)
         case .text(let s, let p, let c, let f): return .text(s, t(p), c, f)
+        case .blur(let r, let tile): return .blur(NSRect(origin: t(r.origin), size: r.size), tile)
         }
     }
 }
@@ -161,6 +178,9 @@ final class EditorCanvas: NSView {
             switch tool {
             case .arrow: Annotation.arrow(s, c, color).draw(lineWidth: lw)
             case .box: Annotation.box(r, color).draw(lineWidth: lw)
+            case .blur:
+                NSColor.black.withAlphaComponent(0.35).setFill()
+                NSBezierPath(rect: r).fill()
             case .crop:
                 NSColor.controlAccentColor.withAlphaComponent(0.15).setFill()
                 NSBezierPath(rect: r).fill()
@@ -204,6 +224,13 @@ final class EditorCanvas: NSView {
             if let s = dragStart {
                 let r = rect(from: s, to: p)
                 if r.width * viewScale > 6, r.height * viewScale > 6 { addMark(.box(r, color)) }
+            }
+        case .blur:
+            if let s = dragStart {
+                let r = rect(from: s, to: p)
+                if r.width * viewScale > 6, r.height * viewScale > 6, let tile = pixelTile(for: r) {
+                    addMark(.blur(r, tile))
+                }
             }
         case .crop:
             if let s = dragStart {
@@ -255,6 +282,31 @@ final class EditorCanvas: NSView {
         NSRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
     }
 
+    // Downscale the region to ~12pt blocks; drawn back up with interpolation off = pixelate.
+    private func pixelTile(for r: NSRect) -> NSImage? {
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let s = CGFloat(cg.width) / max(image.size.width, 1)
+        let px = CGRect(x: r.minX * s, y: (image.size.height - r.maxY) * s,
+                        width: r.width * s, height: r.height * s).integral
+        guard px.width > 1, px.height > 1, let crop = cg.cropping(to: px) else { return nil }
+        let w = max(Int(r.width / 12), 2)
+        let h = max(Int(CGFloat(w) * r.height / max(r.width, 1)), 2)
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .calibratedRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let ctx = NSGraphicsContext(bitmapImageRep: rep)
+        else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        NSImage(cgImage: crop, size: NSSize(width: w, height: h))
+            .draw(in: NSRect(x: 0, y: 0, width: w, height: h))
+        ctx.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        let tiny = NSImage(size: NSSize(width: w, height: h))
+        tiny.addRepresentation(rep)
+        return tiny
+    }
+
     // Render image + annotations at full pixel resolution.
     func renderPNG() -> Data? {
         guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
@@ -291,7 +343,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         self.onSave = onSave
         canvas = EditorCanvas(image: image)
         canvas.tool = tool
-        toolPicker = NSSegmentedControl(labels: ["Pen", "Arrow", "Box", "Text", "Crop"],
+        toolPicker = NSSegmentedControl(labels: ["Pen", "Arrow", "Box", "Text", "Blur", "Crop"],
                                         trackingMode: .selectOne, target: nil, action: nil)
         toolPicker.selectedSegment = tool.rawValue
 
@@ -515,6 +567,7 @@ final class ShelfItem: NSObject {
     private let thumbView: ThumbView
     private let bar = NSVisualEffectView()
     private let copyBtn = ActionButton(title: "Copy")
+    private let ocrBtn = ActionButton(title: "OCR")
     private let cropBtn = ActionButton(title: "Crop")
     private let markupBtn = ActionButton(title: "Markup")
     private let closeBtn = ActionButton(title: "✕")
@@ -561,12 +614,13 @@ final class ShelfItem: NSObject {
 
         thumbView.onClick = { [weak self] in self?.openEditor(tool: .pen) }
         copyBtn.onClick = { [weak self] in self?.copyToClipboard() }
+        ocrBtn.onClick = { [weak self] in self?.runOCR() }
         cropBtn.onClick = { [weak self] in self?.openEditor(tool: .crop) }
         markupBtn.onClick = { [weak self] in self?.openEditor(tool: .pen) }
         closeBtn.onClick = { [weak self] in self?.close() }
 
         container.addSubview(thumbView)
-        [copyBtn, cropBtn, markupBtn, closeBtn].forEach { bar.addSubview($0) }
+        [copyBtn, ocrBtn, cropBtn, markupBtn, closeBtn].forEach { bar.addSubview($0) }
         container.addSubview(bar)
         panel.contentView = container
 
@@ -584,7 +638,7 @@ final class ShelfItem: NSObject {
         bar.frame = NSRect(x: 0, y: size.height, width: size.width, height: Self.barHeight)
 
         var x: CGFloat = 6
-        for btn in [copyBtn, cropBtn, markupBtn] {
+        for btn in [copyBtn, ocrBtn, cropBtn, markupBtn] {
             btn.frame.origin = NSPoint(x: x, y: (Self.barHeight - btn.frame.height) / 2)
             x += btn.frame.width + 4
         }
@@ -606,6 +660,44 @@ final class ShelfItem: NSObject {
             self?.copyBtn.sizeToFit()
         }
         copyBtn.sizeToFit()
+    }
+
+    // On-device text recognition → clipboard.
+    private func runOCR() {
+        ocrBtn.title = "…"
+        ocrBtn.sizeToFit()
+        let u = url
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var text = ""
+            if let img = NSImage(contentsOf: u),
+               let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                let req = VNRecognizeTextRequest()
+                req.recognitionLevel = .accurate
+                req.usesLanguageCorrection = true
+                try? VNImageRequestHandler(cgImage: cg).perform([req])
+                text = (req.results ?? [])
+                    .compactMap { $0.topCandidates(1).first?.string }
+                    .joined(separator: "\n")
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if text.isEmpty {
+                    self.ocrBtn.title = "No text"
+                } else {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(text, forType: .string)
+                    self.ocrBtn.title = "Copied ✓"
+                }
+                self.ocrBtn.sizeToFit()
+                self.layout()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                    self.ocrBtn.title = "OCR"
+                    self.ocrBtn.sizeToFit()
+                    self.layout()
+                }
+            }
+        }
     }
 
     private func openEditor(tool: Tool) {
@@ -674,11 +766,12 @@ final class ShelfItem: NSObject {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var items: [ShelfItem] = []
     private var hotKeyRefs: [EventHotKeyRef?] = []
     private var loginItem: NSMenuItem!
+    private let recentMenu = NSMenu()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -697,9 +790,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         restart.target = self
         loginItem = NSMenuItem(title: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
+        let recent = NSMenuItem(title: "Recent Captures", action: nil, keyEquivalent: "")
+        recentMenu.delegate = self
+        recent.submenu = recentMenu
         menu.addItem(area)
         menu.addItem(full)
         menu.addItem(.separator())
+        menu.addItem(recent)
         menu.addItem(clear)
         menu.addItem(.separator())
         menu.addItem(loginItem)
@@ -772,7 +869,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
         let name = "Screenshot \(df.string(from: Date())).png"
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        let url = saveDir.appendingPathComponent(name)
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
@@ -804,7 +901,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         item.panel.orderFrontRegardless()
         items.append(item)
+
+        // Auto-copy: capture is on the clipboard immediately, no button needed.
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.writeObjects([image, url as NSURL])
     }
+
+    // MARK: - Recent captures submenu (rebuilt each time the menu opens)
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === recentMenu else { return }
+        menu.removeAllItems()
+        let fm = FileManager.default
+        let files = ((try? fm.contentsOfDirectory(at: saveDir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+            .filter { $0.pathExtension.lowercased() == "png" }
+            .sorted {
+                let da = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                let db = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                return da > db
+            }
+            .prefix(10)
+        if files.isEmpty {
+            menu.addItem(NSMenuItem(title: "No captures yet", action: nil, keyEquivalent: ""))
+        }
+        for f in files {
+            let mi = NSMenuItem(title: f.deletingPathExtension().lastPathComponent,
+                                action: #selector(rePin(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = f
+            if let img = NSImage(contentsOf: f) {
+                let h: CGFloat = 32
+                let w = max(h * img.size.width / max(img.size.height, 1), 8)
+                let thumb = NSImage(size: NSSize(width: w, height: h))
+                thumb.lockFocus()
+                img.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
+                thumb.unlockFocus()
+                mi.image = thumb
+            }
+            menu.addItem(mi)
+        }
+        menu.addItem(.separator())
+        let folder = NSMenuItem(title: "Open Captures Folder", action: #selector(openFolder), keyEquivalent: "")
+        folder.target = self
+        menu.addItem(folder)
+    }
+
+    @objc private func rePin(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        if let existing = items.first(where: { $0.url == url }) {
+            existing.panel.orderFrontRegardless()
+            return
+        }
+        showThumb(for: url)
+    }
+
+    @objc private func openFolder() { NSWorkspace.shared.open(saveDir) }
 
     @objc private func dismissAll() {
         for item in items { item.panel.orderOut(nil) }
