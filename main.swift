@@ -116,6 +116,13 @@ final class EditorCanvas: NSView {
     var color: NSColor = .systemRed
     var onTextRequest: ((NSPoint) -> Void)?   // image-point where user clicked with text tool
 
+    // Undo stack: annotations undo one mark, crops restore the pre-crop state.
+    private enum EditOp {
+        case mark
+        case crop(NSImage, [Annotation])
+    }
+    private var ops: [EditOp] = []
+
     private var currentPen: [NSPoint] = []
     private var dragStart: NSPoint?
     private var dragCurrent: NSPoint?
@@ -188,15 +195,15 @@ final class EditorCanvas: NSView {
         let p = toImage(event)
         switch tool {
         case .pen:
-            if currentPen.count > 1 { annotations.append(.pen(currentPen, color)) }
+            if currentPen.count > 1 { addMark(.pen(currentPen, color)) }
         case .arrow:
             if let s = dragStart, hypot(p.x - s.x, p.y - s.y) * viewScale > 6 {
-                annotations.append(.arrow(s, p, color))
+                addMark(.arrow(s, p, color))
             }
         case .box:
             if let s = dragStart {
                 let r = rect(from: s, to: p)
-                if r.width * viewScale > 6, r.height * viewScale > 6 { annotations.append(.box(r, color)) }
+                if r.width * viewScale > 6, r.height * viewScale > 6 { addMark(.box(r, color)) }
             }
         case .crop:
             if let s = dragStart {
@@ -215,18 +222,31 @@ final class EditorCanvas: NSView {
         super.keyDown(with: event)
     }
 
+    func addMark(_ a: Annotation) {
+        annotations.append(a)
+        ops.append(.mark)
+    }
+
     func undo() {
-        _ = annotations.popLast()
+        switch ops.popLast() {
+        case .mark:
+            _ = annotations.popLast()
+        case .crop(let prevImage, let prevAnnotations):
+            image = prevImage
+            annotations = prevAnnotations
+        case nil:
+            break
+        }
         needsDisplay = true
     }
 
-    // Crop is immediate and destructive within the session (Cancel still discards all).
     private func applyCrop(imageRect r: NSRect) {
         guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
         let s = CGFloat(cg.width) / max(image.size.width, 1)
         let px = CGRect(x: r.minX * s, y: (image.size.height - r.maxY) * s,
                         width: r.width * s, height: r.height * s).integral
         guard px.width > 2, px.height > 2, let cropped = cg.cropping(to: px) else { return }
+        ops.append(.crop(image, annotations))
         image = NSImage(cgImage: cropped, size: NSSize(width: px.width / s, height: px.height / s))
         annotations = annotations.map { $0.translated(by: NSPoint(x: -r.minX, y: -r.minY)) }
     }
@@ -377,8 +397,8 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         let text = field.stringValue
         field.removeFromSuperview()
         guard !text.isEmpty else { return }
-        canvas.annotations.append(.text(text, pendingTextPoint, canvas.color,
-                                        EditorCanvas.fontSize(for: canvas.image)))
+        canvas.addMark(.text(text, pendingTextPoint, canvas.color,
+                             EditorCanvas.fontSize(for: canvas.image)))
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -500,6 +520,7 @@ final class ShelfItem: NSObject {
     private let closeBtn = ActionButton(title: "✕")
     private var watcher: DispatchSourceFileSystemObject?
     private var editor: EditorController?
+    private var closed = false
 
     static func thumbSize(for image: NSImage) -> NSSize {
         let scale = min(1, maxThumbWidth / max(image.size.width, 1))
@@ -597,12 +618,18 @@ final class ShelfItem: NSObject {
             guard let self else { return }
             try? data.write(to: self.url)   // watcher picks this up → thumb reloads + refits
         }
-        e.onClosed = { [weak self] in self?.editor = nil }
+        e.onClosed = { [weak self] in
+            guard let self, !self.closed else { return }
+            self.editor = nil
+            self.panel.orderFrontRegardless()   // bring the thumb back when editing ends
+        }
         editor = e
+        panel.orderOut(nil)   // big editor replaces the small thumb while open
         e.show()
     }
 
     func close() {
+        closed = true
         editor?.close()
         watcher?.cancel()
         watcher = nil
