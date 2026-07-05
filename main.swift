@@ -163,6 +163,7 @@ final class EditorCanvas: NSView {
         let width: CGFloat
     }
     var marks: [Mark] = [] { didSet { needsDisplay = true } }
+    var searchHighlights: [NSRect] = [] { didSet { needsDisplay = true } }   // view-only, never saved
     var tool: Tool = .pen
     var color: NSColor = .systemRed
     var widthScale: CGFloat = 1   // set by the S/M/L picker
@@ -205,6 +206,10 @@ final class EditorCanvas: NSView {
         t.scale(by: viewScale)
         t.concat()
         image.draw(in: NSRect(origin: .zero, size: image.size))
+        if !searchHighlights.isEmpty {
+            NSColor.systemYellow.withAlphaComponent(0.45).setFill()
+            for r in searchHighlights { NSBezierPath(rect: r.insetBy(dx: -3, dy: -3)).fill() }
+        }
         for m in marks { m.a.draw(lineWidth: m.width) }
         let lw = Self.strokeWidth(for: image) * widthScale
         if currentPen.count > 1 {
@@ -375,7 +380,7 @@ final class EditorCanvas: NSView {
 // MARK: - Editor window: centered, big, toolbar of tools + Done/Cancel
 
 final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
-    private let window: NSWindow
+    let window: NSWindow
     private let canvas: EditorCanvas
     private let toolPicker: NSSegmentedControl
     private let widthPicker = NSSegmentedControl(labels: ["S", "M", "L"],
@@ -455,6 +460,13 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     }
 
     func close() { window.close() }
+
+    func showSearchHighlights(_ rects: [NSRect], query: String) {
+        canvas.searchHighlights = rects
+        window.title = rects.isEmpty
+            ? "No matches for “\(query)”"
+            : "\(rects.count) match\(rects.count == 1 ? "" : "es") for “\(query)”"
+    }
 
     private func saveAndClose() {
         commitActiveField()
@@ -959,7 +971,8 @@ final class HistoryGrid: NSView {
 }
 
 final class HistoryWindow: NSObject {
-    var onPin: ((URL) -> Void)? { didSet { grid.onPin = onPin } }
+    var onPin: ((URL) -> Void)?
+    var onPreview: ((URL, String) -> Void)?   // click during an active search
 
     private let window: NSWindow
     private let search = NSSearchField()
@@ -986,6 +999,12 @@ final class HistoryWindow: NSObject {
         scroll.documentView = grid
         scroll.hasVerticalScroller = true
         grid.autoresizingMask = [.width]
+        grid.onPin = { [weak self] url in
+            guard let self else { return }
+            let q = self.search.stringValue
+            // Searching? Open the big preview with matches highlighted. Otherwise re-pin.
+            if q.isEmpty { self.onPin?(url) } else { self.onPreview?(url, q) }
+        }
 
         let container = HistoryContainer(search: search, scroll: scroll)
         window.contentView = container
@@ -1012,6 +1031,34 @@ final class HistoryWindow: NSObject {
             }
         }
         grid.show(urls: urls)
+    }
+
+    // Image-point rects of every occurrence of query, via Vision word boxes.
+    static func matchRects(in url: URL, query: String) -> [NSRect] {
+        guard !query.isEmpty, let img = NSImage(contentsOf: url),
+              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return [] }
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate
+        req.usesLanguageCorrection = true
+        try? VNImageRequestHandler(cgImage: cg).perform([req])
+        let w = img.size.width, h = img.size.height
+        let q = query.lowercased()
+        var rects: [NSRect] = []
+        for obs in req.results ?? [] {
+            guard let cand = obs.topCandidates(1).first else { continue }
+            let text = cand.string.lowercased()
+            var from = text.startIndex
+            while let r = text.range(of: q, range: from..<text.endIndex) {
+                // Vision boxes are normalized with a bottom-left origin — same as image points.
+                if let box = try? cand.boundingBox(for: r) {
+                    let bb = box.boundingBox
+                    rects.append(NSRect(x: bb.minX * w, y: bb.minY * h,
+                                        width: bb.width * w, height: bb.height * h))
+                }
+                from = r.upperBound
+            }
+        }
+        return rects
     }
 
     static func recognizeText(in url: URL) -> String? {
@@ -1147,10 +1194,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
 
         history.onPin = { [weak self] url in self?.showThumb(for: url) }
+        history.onPreview = { [weak self] url, query in self?.openSearchPreview(url: url, query: query) }
         cleanupOldCaptures()
     }
 
     @objc private func openHistory() { history.open() }
+
+    private var previewEditors: [EditorController] = []
+
+    private func openSearchPreview(url: URL, query: String) {
+        guard let image = NSImage(contentsOf: url) else { return }
+        let e = EditorController(image: image, tool: .pen) { data in
+            try? data.write(to: url)
+        }
+        e.onClosed = { [weak self, weak e] in
+            self?.previewEditors.removeAll { $0 === e }
+        }
+        previewEditors.append(e)
+        e.window.title = "Finding “\(query)”…"
+        e.show()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let rects = HistoryWindow.matchRects(in: url, query: query)
+            DispatchQueue.main.async { e.showSearchHighlights(rects, query: query) }
+        }
+    }
 
     private func cleanupOldCaptures() {
         DispatchQueue.global(qos: .utility).async {
