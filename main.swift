@@ -102,7 +102,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func registerHotkeys() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                  eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
+        // Dispatcher target, not application target — app target only delivers
+        // hotkeys while the app is active, and an accessory app never is.
+        InstallEventHandler(GetEventDispatcherTarget(), { _, event, userData in
             var hkID = EventHotKeyID()
             GetEventParameter(event, EventParamName(kEventParamDirectObject),
                               EventParamType(typeEventHotKeyID), nil,
@@ -115,12 +117,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
 
         let sig = OSType(0x534E4150) // "SNAP"
-        RegisterEventHotKey(UInt32(kVK_ANSI_2), UInt32(cmdKey | shiftKey),
-                            EventHotKeyID(signature: sig, id: 1),
-                            GetApplicationEventTarget(), 0, &hotKeyRefs[0])
-        RegisterEventHotKey(UInt32(kVK_ANSI_1), UInt32(cmdKey | shiftKey),
-                            EventHotKeyID(signature: sig, id: 2),
-                            GetApplicationEventTarget(), 0, &hotKeyRefs[1])
+        let s1 = RegisterEventHotKey(UInt32(kVK_ANSI_2), UInt32(cmdKey | shiftKey),
+                                     EventHotKeyID(signature: sig, id: 1),
+                                     GetEventDispatcherTarget(), 0, &hotKeyRefs[0])
+        let s2 = RegisterEventHotKey(UInt32(kVK_ANSI_1), UInt32(cmdKey | shiftKey),
+                                     EventHotKeyID(signature: sig, id: 2),
+                                     GetEventDispatcherTarget(), 0, &hotKeyRefs[1])
+        NSLog("SnapShelf hotkeys: area(⇧⌘2)=%d full(⇧⌘1)=%d (0 = ok)", s1, s2)
     }
 
     // MARK: - Capture
