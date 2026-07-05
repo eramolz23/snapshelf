@@ -1,8 +1,8 @@
 // SnapShelf — minimal screenshot shelf for macOS.
 // Hotkeys: ⇧⌘2 or ⌃⇧2 area capture, ⇧⌘1 or ⌃⇧1 full screen. Also via menu bar icon.
-// Thumbnail floats bottom-left with a toolbar (Copy / Crop / Markup / ✕), stays until
-// clicked. Drag the image into any window to drop the PNG. Markup/Crop open a big
-// centered in-app editor: pen, arrow, box, text, color, undo, crop.
+// Thumbnail floats bottom-left with a toolbar (Copy / Crop / Markup / ✕); ✕ dismisses.
+// Drag the image into any window to drop the PNG. Clicking the image, Markup, or Crop
+// opens a big centered in-app editor: pen, arrow, box, text, color, undo, crop.
 // ponytail: capture delegates to /usr/sbin/screencapture — Apple's selection UI for free.
 
 import Cocoa
@@ -442,7 +442,7 @@ final class EditorContainer: NSView {
 final class ThumbView: NSView, NSDraggingSource {
     var image: NSImage { didSet { layer?.contents = image } }
     let fileURL: URL
-    var onDismiss: (() -> Void)?
+    var onClick: (() -> Void)?
     private var downPoint = NSPoint.zero
     private var dragging = false
 
@@ -475,7 +475,7 @@ final class ThumbView: NSView, NSDraggingSource {
     }
 
     override func mouseUp(with event: NSEvent) {
-        if !dragging { onDismiss?() }   // click (no drag) dismisses
+        if !dragging { onClick?() }   // click (no drag) opens the editor
     }
 
     func draggingSession(_ session: NSDraggingSession,
@@ -538,7 +538,7 @@ final class ShelfItem: NSObject {
         bar.blendingMode = .behindWindow
         bar.state = .active
 
-        thumbView.onDismiss = { [weak self] in self?.close() }
+        thumbView.onClick = { [weak self] in self?.openEditor(tool: .pen) }
         copyBtn.onClick = { [weak self] in self?.copyToClipboard() }
         cropBtn.onClick = { [weak self] in self?.openEditor(tool: .crop) }
         markupBtn.onClick = { [weak self] in self?.openEditor(tool: .pen) }
