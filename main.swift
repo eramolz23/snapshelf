@@ -1,7 +1,9 @@
 // SnapShelf — minimal screenshot shelf for macOS.
 // Hotkeys: ⇧⌘2 or ⌃⇧2 area capture, ⇧⌘1 or ⌃⇧1 full screen. Also via menu bar icon.
-// Thumbnail floats bottom-left, stays until clicked. Copy button. Drag it into any window.
-// ponytail: capture delegates to /usr/sbin/screencapture — Apple's selection UI for free.
+// Thumbnail floats bottom-left with a toolbar (Copy / Crop / Markup / ✕), stays until
+// clicked. Drag the image into any window to drop the PNG.
+// ponytail: capture delegates to /usr/sbin/screencapture, markup delegates to Preview —
+// Apple's selection UI and markup editor for free. File watcher keeps the thumb in sync.
 
 import Cocoa
 import Carbon.HIToolbox
@@ -25,14 +27,29 @@ final class ActionButton: NSButton {
         self.init(title: title, target: nil, action: nil)
         target = self
         action = #selector(clicked)
+        bezelStyle = .recessed
+        showsBorderOnlyWhileMouseInside = true
+        controlSize = .small
+        font = .systemFont(ofSize: 11)
+        sizeToFit()
     }
     @objc private func clicked() { onClick?() }
 }
 
+// MARK: - Image view: drag out, click to dismiss, crop selection
+
 final class ThumbView: NSView, NSDraggingSource {
-    private let image: NSImage
-    private let fileURL: URL
+    var image: NSImage { didSet { layer?.contents = image } }
+    let fileURL: URL
     var onDismiss: (() -> Void)?
+    var onCrop: ((NSRect) -> Void)?
+    var cropMode = false {
+        didSet {
+            selectionBox.isHidden = true
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+    private let selectionBox = NSView()
     private var downPoint = NSPoint.zero
     private var dragging = false
 
@@ -43,24 +60,37 @@ final class ThumbView: NSView, NSDraggingSource {
         wantsLayer = true
         layer?.contents = image
         layer?.contentsGravity = .resizeAspectFill
-        layer?.cornerRadius = 10
-        layer?.masksToBounds = true
-        layer?.borderWidth = 1
-        layer?.borderColor = NSColor.separatorColor.cgColor
+        selectionBox.wantsLayer = true
+        selectionBox.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.25).cgColor
+        selectionBox.layer?.borderColor = NSColor.controlAccentColor.cgColor
+        selectionBox.layer?.borderWidth = 1
+        selectionBox.isHidden = true
+        addSubview(selectionBox)
     }
     required init?(coder: NSCoder) { fatalError("unused") }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    override func resetCursorRects() {
+        if cropMode { addCursorRect(bounds, cursor: .crosshair) }
+    }
+
     override func mouseDown(with event: NSEvent) {
-        downPoint = event.locationInWindow
+        downPoint = convert(event.locationInWindow, from: nil)
         dragging = false
+        if cropMode {
+            selectionBox.frame = NSRect(origin: downPoint, size: .zero)
+            selectionBox.isHidden = false
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard !dragging else { return }
-        let p = event.locationInWindow
-        guard hypot(p.x - downPoint.x, p.y - downPoint.y) > 4 else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        if cropMode {
+            selectionBox.frame = rect(from: downPoint, to: p)
+            return
+        }
+        guard !dragging, hypot(p.x - downPoint.x, p.y - downPoint.y) > 4 else { return }
         dragging = true
         // ponytail: drag payload is the file URL only — covers Finder, Slack, browsers,
         // mail, chat. Add an NSImage writer too if some app refuses file drops.
@@ -70,16 +100,208 @@ final class ThumbView: NSView, NSDraggingSource {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if cropMode {
+            let sel = selectionBox.frame
+            selectionBox.isHidden = true
+            if sel.width > 8, sel.height > 8 { onCrop?(sel) }
+            return
+        }
         if !dragging { onDismiss?() }   // click (no drag) dismisses
+    }
+
+    private func rect(from a: NSPoint, to b: NSPoint) -> NSRect {
+        NSRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
     }
 
     func draggingSession(_ session: NSDraggingSession,
                          sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
 }
 
+// MARK: - One pinned screenshot: panel + toolbar + image + file watcher
+
+final class ShelfItem: NSObject {
+    static let barHeight: CGFloat = 26
+
+    let panel: NSPanel
+    let url: URL
+    var onClosed: ((ShelfItem) -> Void)?
+
+    private var image: NSImage
+    private let thumbView: ThumbView
+    private let bar = NSVisualEffectView()
+    private let copyBtn = ActionButton(title: "Copy")
+    private let cropBtn = ActionButton(title: "Crop")
+    private let markupBtn = ActionButton(title: "Markup")
+    private let closeBtn = ActionButton(title: "✕")
+    private var watcher: DispatchSourceFileSystemObject?
+
+    static func thumbSize(for image: NSImage) -> NSSize {
+        let scale = min(1, maxThumbWidth / max(image.size.width, 1))
+        return NSSize(width: max(image.size.width * scale, 60),
+                      height: max(image.size.height * scale, 40))
+    }
+
+    init(url: URL, image: NSImage, origin: NSPoint) {
+        self.url = url
+        self.image = image
+        self.thumbView = ThumbView(image: image, fileURL: url)
+
+        let size = ShelfItem.thumbSize(for: image)
+        let total = NSSize(width: size.width, height: size.height + ShelfItem.barHeight)
+        panel = NSPanel(contentRect: NSRect(origin: origin, size: total),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        super.init()
+
+        panel.level = .floating
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let container = NSView(frame: NSRect(origin: .zero, size: total))
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 10
+        container.layer?.masksToBounds = true
+        container.layer?.borderWidth = 1
+        container.layer?.borderColor = NSColor.separatorColor.cgColor
+
+        bar.material = .titlebar
+        bar.blendingMode = .behindWindow
+        bar.state = .active
+
+        thumbView.onDismiss = { [weak self] in self?.close() }
+        thumbView.onCrop = { [weak self] r in self?.crop(viewRect: r) }
+
+        copyBtn.onClick = { [weak self] in self?.copyToClipboard() }
+        cropBtn.onClick = { [weak self] in self?.toggleCropMode() }
+        markupBtn.onClick = { [weak self] in self?.openInPreview() }
+        closeBtn.onClick = { [weak self] in self?.close() }
+
+        container.addSubview(thumbView)
+        [copyBtn, cropBtn, markupBtn, closeBtn].forEach { bar.addSubview($0) }
+        container.addSubview(bar)
+        panel.contentView = container
+
+        layout()
+        startWatching()
+    }
+
+    private func layout() {
+        let size = ShelfItem.thumbSize(for: image)
+        var frame = panel.frame
+        frame.size = NSSize(width: size.width, height: size.height + Self.barHeight)
+        panel.setFrame(frame, display: true)   // origin fixed → stays anchored bottom-left
+
+        thumbView.frame = NSRect(x: 0, y: 0, width: size.width, height: size.height)
+        bar.frame = NSRect(x: 0, y: size.height, width: size.width, height: Self.barHeight)
+
+        var x: CGFloat = 6
+        for btn in [copyBtn, cropBtn, markupBtn] {
+            btn.frame.origin = NSPoint(x: x, y: (Self.barHeight - btn.frame.height) / 2)
+            x += btn.frame.width + 4
+        }
+        closeBtn.frame.origin = NSPoint(x: size.width - closeBtn.frame.width - 6,
+                                        y: (Self.barHeight - closeBtn.frame.height) / 2)
+    }
+
+    // MARK: Actions
+
+    private func copyToClipboard() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        // Read from disk so markup edits saved in Preview are what gets copied.
+        let current = NSImage(contentsOf: url) ?? image
+        pb.writeObjects([current, url as NSURL])
+        copyBtn.title = "Copied ✓"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.copyBtn.title = "Copy"
+            self?.copyBtn.sizeToFit()
+        }
+        copyBtn.sizeToFit()
+    }
+
+    private func toggleCropMode() {
+        thumbView.cropMode.toggle()
+        cropBtn.title = thumbView.cropMode ? "Cancel" : "Crop"
+        cropBtn.sizeToFit()
+    }
+
+    private func openInPreview() {
+        NSWorkspace.shared.open([url],
+                                withApplicationAt: URL(fileURLWithPath: "/System/Applications/Preview.app"),
+                                configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    private func crop(viewRect r: NSRect) {
+        thumbView.cropMode = false
+        cropBtn.title = "Crop"
+        cropBtn.sizeToFit()
+
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        let vs = thumbView.bounds.size
+        let sx = CGFloat(cg.width) / max(vs.width, 1)
+        let sy = CGFloat(cg.height) / max(vs.height, 1)
+        // View coords are bottom-left origin, CGImage crop is top-left origin — flip y.
+        let pixelRect = CGRect(x: r.minX * sx,
+                               y: (vs.height - r.maxY) * sy,
+                               width: r.width * sx,
+                               height: r.height * sy).integral
+        guard pixelRect.width > 4, pixelRect.height > 4, let cropped = cg.cropping(to: pixelRect),
+              let png = NSBitmapImageRep(cgImage: cropped).representation(using: .png, properties: [:])
+        else { return }
+        try? png.write(to: url)   // watcher picks this up → thumb reloads + panel refits
+    }
+
+    private func close() {
+        watcher?.cancel()
+        watcher = nil
+        panel.orderOut(nil)
+        onClosed?(self)
+    }
+
+    // MARK: File watcher — Preview saves land back on the thumbnail
+
+    private func startWatching() {
+        let fd = open(url.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename], queue: .main)
+        src.setEventHandler { [weak self] in
+            guard let self, let w = self.watcher else { return }
+            let flags = w.data
+            // Atomic saves (Preview) replace the file: re-arm the watch on the new inode.
+            if flags.contains(.delete) || flags.contains(.rename) {
+                w.cancel()
+                self.watcher = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    self.reloadFromDisk()
+                    self.startWatching()
+                }
+            } else {
+                self.reloadFromDisk()
+            }
+        }
+        src.setCancelHandler { Darwin.close(fd) }
+        src.resume()
+        watcher = src
+    }
+
+    private func reloadFromDisk() {
+        guard let img = NSImage(contentsOf: url) else { return }
+        image = img
+        thumbView.image = img
+        layout()
+    }
+}
+
+// MARK: - App
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var panels: [NSPanel] = []
+    private var items: [ShelfItem] = []
     private var hotKeyRefs: [EventHotKeyRef?] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -166,60 +388,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showThumb(for url: URL) {
         guard let image = NSImage(contentsOf: url), let screen = NSScreen.main else { return }
 
-        let scale = min(1, maxThumbWidth / max(image.size.width, 1))
-        let size = NSSize(width: max(image.size.width * scale, 60),
-                          height: max(image.size.height * scale, 40))
         // ponytail: new thumbs stack upward from bottom-left; gaps after dismissals
         // aren't repacked — restack logic when it bothers you.
-        let stackedHeight = panels.reduce(CGFloat(0)) { $0 + $1.frame.height + 8 }
+        let stackedHeight = items.reduce(CGFloat(0)) { $0 + $1.panel.frame.height + 8 }
         let origin = NSPoint(x: screen.visibleFrame.minX + screenMargin,
                              y: screen.visibleFrame.minY + screenMargin + stackedHeight)
 
-        let panel = NSPanel(contentRect: NSRect(origin: origin, size: size),
-                            styleMask: [.borderless, .nonactivatingPanel],
-                            backing: .buffered, defer: false)
-        panel.level = .floating
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.hidesOnDeactivate = false
-        panel.isReleasedWhenClosed = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-
-        let thumb = ThumbView(image: image, fileURL: url)
-        thumb.frame = NSRect(origin: .zero, size: size)
-        thumb.autoresizingMask = [.width, .height]
-        thumb.onDismiss = { [weak self, weak panel] in
-            guard let self, let panel else { return }
-            panel.orderOut(nil)
-            self.panels.removeAll { $0 === panel }
+        let item = ShelfItem(url: url, image: image, origin: origin)
+        item.onClosed = { [weak self] it in
+            self?.items.removeAll { $0 === it }
         }
-
-        let copyBtn = ActionButton(title: "Copy")
-        copyBtn.bezelStyle = .rounded
-        copyBtn.controlSize = .small
-        copyBtn.font = .systemFont(ofSize: 11)
-        copyBtn.sizeToFit()
-        copyBtn.frame.origin = NSPoint(x: size.width - copyBtn.frame.width - 6,
-                                       y: size.height - copyBtn.frame.height - 6)
-        copyBtn.autoresizingMask = [.minXMargin, .minYMargin]
-        copyBtn.onClick = { [weak copyBtn] in
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.writeObjects([image, url as NSURL])
-            copyBtn?.title = "Copied ✓"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { copyBtn?.title = "Copy" }
-        }
-
-        thumb.addSubview(copyBtn)
-        panel.contentView = thumb
-        panel.orderFrontRegardless()
-        panels.append(panel)
+        item.panel.orderFrontRegardless()
+        items.append(item)
     }
 
     @objc private func dismissAll() {
-        panels.forEach { $0.orderOut(nil) }
-        panels.removeAll()
+        for item in items { item.panel.orderOut(nil) }
+        items.removeAll()
     }
 }
 
