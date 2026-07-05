@@ -40,9 +40,25 @@ Note: the build is ad-hoc signed, so every rebuild invalidates that permission �
 
 ## Installing a prebuilt zip (no Xcode)
 
-If someone sent you `SnapShelf.zip`: unzip, move `SnapShelf.app` to `~/Applications`,
-then **right-click → Open → Open** the first time (it isn't notarized, so macOS warns
-once). After that it behaves like any other app.
+If you downloaded `SnapShelf-x.y.z.zip` (e.g. from a GitHub release): unzip and move
+`SnapShelf.app` to `~/Applications`. The app isn't notarized (no Apple Developer
+account), so the first launch is blocked once:
+
+1. Double-click the app — macOS says it can't be opened.
+2. Open **System Settings → Privacy & Security**, scroll down, click **Open Anyway**,
+   and confirm. (On macOS 14 and earlier, right-click → Open → Open also works.)
+
+Terminal alternative: `xattr -dr com.apple.quarantine ~/Applications/SnapShelf.app`,
+then open normally. After the first launch it behaves like any other app.
+
+## Cutting a release
+
+```sh
+./release.sh   # builds dist/SnapShelf-<version>.zip — no install, no permission reset
+```
+
+Bump `CFBundleShortVersionString` in `Info.plist` first. `gen_icon.sh` regenerates
+`AppIcon.icns` if the icon design changes.
 
 ## Configuration
 

@@ -7,9 +7,10 @@ cd "$(dirname "$0")"
 swiftc -O -swift-version 5 main.swift -o SnapShelf
 
 APP="$HOME/Applications/SnapShelf.app"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp SnapShelf "$APP/Contents/MacOS/SnapShelf"
 cp Info.plist "$APP/Contents/Info.plist"
+cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$APP"
 
 # Ad-hoc signature changes every build, which silently invalidates the old

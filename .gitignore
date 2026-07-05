@@ -1,2 +1,4 @@
 SnapShelf
 .DS_Store
+dist/
+graphify-out/
