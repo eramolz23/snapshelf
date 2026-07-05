@@ -1014,37 +1014,56 @@ final class HistoryWindow: NSObject {
         grid.show(urls: urls)
     }
 
+    static func recognizeText(in url: URL) -> String? {
+        guard let img = NSImage(contentsOf: url),
+              let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let req = VNRecognizeTextRequest()
+        // .accurate, not .fast — fast mode mangles screenshot text into
+        // garbage that no search query can match. Runs once per file.
+        req.recognitionLevel = .accurate
+        req.usesLanguageCorrection = true
+        try? VNImageRequestHandler(cgImage: cg).perform([req])
+        return (req.results ?? [])
+            .compactMap { $0.topCandidates(1).first?.string }
+            .joined(separator: " ")
+    }
+
+    // Called on every new capture so search is current without reopening the window.
+    func indexFile(_ url: URL) {
+        guard index[url.lastPathComponent] == nil else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let text = HistoryWindow.recognizeText(in: url) else { return }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.index[url.lastPathComponent] = text
+                self.saveIndex()
+            }
+        }
+    }
+
     // OCR every un-indexed capture in the background so search-by-content works.
     private func buildIndex() {
         guard !indexing else { return }
         indexing = true
+        window.title = "SnapShelf History — indexing…"
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             var idx = self.loadIndex()
-            var changed = false
             for f in capturedFiles() where idx[f.lastPathComponent] == nil {
-                guard let img = NSImage(contentsOf: f),
-                      let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { continue }
-                let req = VNRecognizeTextRequest()
-                // .accurate, not .fast — fast mode mangles screenshot text into
-                // garbage that no search query can match. Runs once per file.
-                req.recognitionLevel = .accurate
-                req.usesLanguageCorrection = true
-                try? VNImageRequestHandler(cgImage: cg).perform([req])
-                idx[f.lastPathComponent] = (req.results ?? [])
-                    .compactMap { $0.topCandidates(1).first?.string }
-                    .joined(separator: " ")
-                changed = true
-            }
-            if changed, let data = try? JSONEncoder().encode(idx) {
-                try? data.write(to: self.indexURL)
+                idx[f.lastPathComponent] = HistoryWindow.recognizeText(in: f) ?? ""
             }
             DispatchQueue.main.async {
-                self.index = idx
+                self.index.merge(idx) { _, new in new }
+                self.saveIndex()
                 self.indexing = false
-                if !self.search.stringValue.isEmpty { self.reload() }
+                self.window.title = "SnapShelf History"
+                self.reload()
             }
         }
+    }
+
+    private func saveIndex() {
+        if let data = try? JSONEncoder().encode(index) { try? data.write(to: indexURL) }
     }
 
     private func loadIndex() -> [String: String] {
@@ -1238,6 +1257,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.writeObjects([image, url as NSURL])
+
+        history.indexFile(url)   // searchable right away, no window reopen needed
     }
 
     // MARK: - Recent captures submenu (rebuilt each time the menu opens)
