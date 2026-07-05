@@ -1,5 +1,5 @@
 // SnapShelf — minimal screenshot shelf for macOS.
-// Hotkeys: ⇧⌘2 area capture, ⇧⌘1 full screen. Also via menu bar icon.
+// Hotkeys: ⇧⌘2 or ⌃⇧2 area capture, ⇧⌘1 or ⌃⇧1 full screen. Also via menu bar icon.
 // Thumbnail floats bottom-left, stays until clicked. Copy button. Drag it into any window.
 // ponytail: capture delegates to /usr/sbin/screencapture — Apple's selection UI for free.
 
@@ -8,6 +8,15 @@ import Carbon.HIToolbox
 
 private let maxThumbWidth: CGFloat = 320
 private let screenMargin: CGFloat = 16
+
+// Hotkeys — edit here, rebuild with build.sh. id 1 = area capture, id 2 = full screen.
+// Two combos per action: ⇧⌘ (matches system screenshot muscle memory) and ⌃⇧ (conflict-free fallback).
+private let hotkeys: [(keyCode: Int, modifiers: Int, id: UInt32)] = [
+    (kVK_ANSI_2, cmdKey | shiftKey, 1),
+    (kVK_ANSI_1, cmdKey | shiftKey, 2),
+    (kVK_ANSI_2, controlKey | shiftKey, 1),
+    (kVK_ANSI_1, controlKey | shiftKey, 2),
+]
 
 final class ActionButton: NSButton {
     var onClick: (() -> Void)?
@@ -71,7 +80,7 @@ final class ThumbView: NSView, NSDraggingSource {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var panels: [NSPanel] = []
-    private var hotKeyRefs: [EventHotKeyRef?] = [nil, nil]
+    private var hotKeyRefs: [EventHotKeyRef?] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -110,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                               EventParamType(typeEventHotKeyID), nil,
                               MemoryLayout<EventHotKeyID>.size, nil, &hkID)
             let me = Unmanaged<AppDelegate>.fromOpaque(userData!).takeUnretainedValue()
+            NSLog("SnapShelf hotkey fired: id=%d", hkID.id)
             DispatchQueue.main.async {
                 hkID.id == 1 ? me.captureArea() : me.captureFull()
             }
@@ -117,13 +127,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
 
         let sig = OSType(0x534E4150) // "SNAP"
-        let s1 = RegisterEventHotKey(UInt32(kVK_ANSI_2), UInt32(cmdKey | shiftKey),
-                                     EventHotKeyID(signature: sig, id: 1),
-                                     GetEventDispatcherTarget(), 0, &hotKeyRefs[0])
-        let s2 = RegisterEventHotKey(UInt32(kVK_ANSI_1), UInt32(cmdKey | shiftKey),
-                                     EventHotKeyID(signature: sig, id: 2),
-                                     GetEventDispatcherTarget(), 0, &hotKeyRefs[1])
-        NSLog("SnapShelf hotkeys: area(⇧⌘2)=%d full(⇧⌘1)=%d (0 = ok)", s1, s2)
+        for (i, hk) in hotkeys.enumerated() {
+            var ref: EventHotKeyRef?
+            let status = RegisterEventHotKey(UInt32(hk.keyCode), UInt32(hk.modifiers),
+                                             EventHotKeyID(signature: sig, id: hk.id),
+                                             GetEventDispatcherTarget(), 0, &ref)
+            hotKeyRefs.append(ref)
+            NSLog("SnapShelf hotkey %d (action %d) registered: %d (0 = ok)", i, hk.id, status)
+        }
     }
 
     // MARK: - Capture
