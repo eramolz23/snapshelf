@@ -1,12 +1,13 @@
 // SnapShelf — minimal screenshot shelf for macOS.
 // Hotkeys: ⇧⌘2 or ⌃⇧2 area capture, ⇧⌘1 or ⌃⇧1 full screen. Also via menu bar icon.
 // Thumbnail floats bottom-left with a toolbar (Copy / Crop / Markup / ✕), stays until
-// clicked. Drag the image into any window to drop the PNG.
-// ponytail: capture delegates to /usr/sbin/screencapture, markup delegates to Preview —
-// Apple's selection UI and markup editor for free. File watcher keeps the thumb in sync.
+// clicked. Drag the image into any window to drop the PNG. Markup/Crop open a big
+// centered in-app editor: pen, arrow, box, text, color, undo, crop.
+// ponytail: capture delegates to /usr/sbin/screencapture — Apple's selection UI for free.
 
 import Cocoa
 import Carbon.HIToolbox
+import ServiceManagement
 
 private let maxThumbWidth: CGFloat = 320
 private let screenMargin: CGFloat = 16
@@ -36,20 +37,412 @@ final class ActionButton: NSButton {
     @objc private func clicked() { onClick?() }
 }
 
-// MARK: - Image view: drag out, click to dismiss, crop selection
+// MARK: - Annotations
+
+enum Tool: Int { case pen = 0, arrow, box, text, crop }
+
+enum Annotation {
+    case pen([NSPoint], NSColor)
+    case arrow(NSPoint, NSPoint, NSColor)
+    case box(NSRect, NSColor)
+    case text(String, NSPoint, NSColor, CGFloat)
+
+    func draw(lineWidth lw: CGFloat) {
+        switch self {
+        case .pen(let pts, let c):
+            guard pts.count > 1 else { return }
+            c.setStroke()
+            let p = NSBezierPath()
+            p.lineWidth = lw
+            p.lineCapStyle = .round
+            p.lineJoinStyle = .round
+            p.move(to: pts[0])
+            for pt in pts.dropFirst() { p.line(to: pt) }
+            p.stroke()
+        case .arrow(let a, let b, let c):
+            c.setStroke()
+            c.setFill()
+            let p = NSBezierPath()
+            p.lineWidth = lw
+            p.lineCapStyle = .round
+            p.move(to: a)
+            p.line(to: b)
+            p.stroke()
+            let ang = atan2(b.y - a.y, b.x - a.x)
+            let hl = lw * 4
+            let p1 = NSPoint(x: b.x - hl * cos(ang - .pi / 7), y: b.y - hl * sin(ang - .pi / 7))
+            let p2 = NSPoint(x: b.x - hl * cos(ang + .pi / 7), y: b.y - hl * sin(ang + .pi / 7))
+            let head = NSBezierPath()
+            head.move(to: b)
+            head.line(to: p1)
+            head.line(to: p2)
+            head.close()
+            head.fill()
+        case .box(let r, let c):
+            c.setStroke()
+            let p = NSBezierPath(rect: r)
+            p.lineWidth = lw
+            p.stroke()
+        case .text(let s, let pt, let c, let fs):
+            NSAttributedString(string: s, attributes: [
+                .font: NSFont.boldSystemFont(ofSize: fs),
+                .foregroundColor: c,
+            ]).draw(at: pt)
+        }
+    }
+
+    func translated(by d: NSPoint) -> Annotation {
+        func t(_ p: NSPoint) -> NSPoint { NSPoint(x: p.x + d.x, y: p.y + d.y) }
+        switch self {
+        case .pen(let pts, let c): return .pen(pts.map(t), c)
+        case .arrow(let a, let b, let c): return .arrow(t(a), t(b), c)
+        case .box(let r, let c): return .box(NSRect(origin: t(r.origin), size: r.size), c)
+        case .text(let s, let p, let c, let f): return .text(s, t(p), c, f)
+        }
+    }
+}
+
+// MARK: - Editor canvas: draws image + annotations, handles tool input in image coords
+
+final class EditorCanvas: NSView {
+    var image: NSImage {
+        didSet {
+            superview?.needsLayout = true
+            needsDisplay = true
+        }
+    }
+    var annotations: [Annotation] = [] { didSet { needsDisplay = true } }
+    var tool: Tool = .pen
+    var color: NSColor = .systemRed
+    var onTextRequest: ((NSPoint) -> Void)?   // image-point where user clicked with text tool
+
+    private var currentPen: [NSPoint] = []
+    private var dragStart: NSPoint?
+    private var dragCurrent: NSPoint?
+
+    static func strokeWidth(for image: NSImage) -> CGFloat { max(2, image.size.width / 250) }
+    static func fontSize(for image: NSImage) -> CGFloat { max(14, image.size.width / 30) }
+
+    var viewScale: CGFloat { bounds.width / max(image.size.width, 1) }
+    private func toImage(_ e: NSEvent) -> NSPoint {
+        let p = convert(e.locationInWindow, from: nil)
+        return NSPoint(x: p.x / viewScale, y: p.y / viewScale)
+    }
+
+    init(image: NSImage) {
+        self.image = image
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard image.size.width > 0 else { return }
+        let t = NSAffineTransform()
+        t.scale(by: viewScale)
+        t.concat()
+        image.draw(in: NSRect(origin: .zero, size: image.size))
+        let lw = Self.strokeWidth(for: image)
+        for a in annotations { a.draw(lineWidth: lw) }
+        if currentPen.count > 1 { Annotation.pen(currentPen, color).draw(lineWidth: lw) }
+        if let s = dragStart, let c = dragCurrent {
+            let r = rect(from: s, to: c)
+            switch tool {
+            case .arrow: Annotation.arrow(s, c, color).draw(lineWidth: lw)
+            case .box: Annotation.box(r, color).draw(lineWidth: lw)
+            case .crop:
+                NSColor.controlAccentColor.withAlphaComponent(0.15).setFill()
+                NSBezierPath(rect: r).fill()
+                NSColor.controlAccentColor.setStroke()
+                let p = NSBezierPath(rect: r)
+                p.lineWidth = max(1, lw / 2)
+                p.setLineDash([6, 4], count: 2, phase: 0)
+                p.stroke()
+            default: break
+            }
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)   // commits any active text field
+        let p = toImage(event)
+        switch tool {
+        case .text: onTextRequest?(p)
+        case .pen: currentPen = [p]
+        default: dragStart = p; dragCurrent = p
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let p = toImage(event)
+        if tool == .pen { currentPen.append(p) } else { dragCurrent = p }
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer { currentPen = []; dragStart = nil; dragCurrent = nil; needsDisplay = true }
+        let p = toImage(event)
+        switch tool {
+        case .pen:
+            if currentPen.count > 1 { annotations.append(.pen(currentPen, color)) }
+        case .arrow:
+            if let s = dragStart, hypot(p.x - s.x, p.y - s.y) * viewScale > 6 {
+                annotations.append(.arrow(s, p, color))
+            }
+        case .box:
+            if let s = dragStart {
+                let r = rect(from: s, to: p)
+                if r.width * viewScale > 6, r.height * viewScale > 6 { annotations.append(.box(r, color)) }
+            }
+        case .crop:
+            if let s = dragStart {
+                let r = rect(from: s, to: p)
+                if r.width * viewScale > 8, r.height * viewScale > 8 { applyCrop(imageRect: r) }
+            }
+        case .text: break
+        }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "z" {
+            undo()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    func undo() {
+        _ = annotations.popLast()
+        needsDisplay = true
+    }
+
+    // Crop is immediate and destructive within the session (Cancel still discards all).
+    private func applyCrop(imageRect r: NSRect) {
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        let s = CGFloat(cg.width) / max(image.size.width, 1)
+        let px = CGRect(x: r.minX * s, y: (image.size.height - r.maxY) * s,
+                        width: r.width * s, height: r.height * s).integral
+        guard px.width > 2, px.height > 2, let cropped = cg.cropping(to: px) else { return }
+        image = NSImage(cgImage: cropped, size: NSSize(width: px.width / s, height: px.height / s))
+        annotations = annotations.map { $0.translated(by: NSPoint(x: -r.minX, y: -r.minY)) }
+    }
+
+    private func rect(from a: NSPoint, to b: NSPoint) -> NSRect {
+        NSRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
+    }
+
+    // Render image + annotations at full pixel resolution.
+    func renderPNG() -> Data? {
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: cg.width, pixelsHigh: cg.height,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .calibratedRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let ctx = NSGraphicsContext(bitmapImageRep: rep)
+        else { return nil }
+        rep.size = image.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        image.draw(in: NSRect(origin: .zero, size: image.size))
+        let lw = Self.strokeWidth(for: image)
+        for a in annotations { a.draw(lineWidth: lw) }
+        ctx.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .png, properties: [:])
+    }
+}
+
+// MARK: - Editor window: centered, big, toolbar of tools + Done/Cancel
+
+final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
+    private let window: NSWindow
+    private let canvas: EditorCanvas
+    private let toolPicker: NSSegmentedControl
+    private let colorWell = NSColorWell()
+    private let onSave: (Data) -> Void
+    private var activeField: NSTextField?
+    private var pendingTextPoint = NSPoint.zero
+    var onClosed: (() -> Void)?
+
+    init(image: NSImage, tool: Tool, onSave: @escaping (Data) -> Void) {
+        self.onSave = onSave
+        canvas = EditorCanvas(image: image)
+        canvas.tool = tool
+        toolPicker = NSSegmentedControl(labels: ["Pen", "Arrow", "Box", "Text", "Crop"],
+                                        trackingMode: .selectOne, target: nil, action: nil)
+        toolPicker.selectedSegment = tool.rawValue
+
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let barH: CGFloat = 48
+        let avail = NSSize(width: screen.width * 0.8, height: screen.height * 0.85 - barH)
+        let s = min(avail.width / max(image.size.width, 1), avail.height / max(image.size.height, 1))
+        let content = NSSize(width: max(image.size.width * s, 480),
+                             height: image.size.height * s + barH)
+
+        window = NSWindow(contentRect: NSRect(origin: .zero, size: content),
+                          styleMask: [.titled, .closable, .resizable],
+                          backing: .buffered, defer: false)
+        super.init()
+
+        window.title = "Edit Screenshot"
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+
+        toolPicker.target = self
+        toolPicker.action = #selector(toolChanged)
+        colorWell.color = canvas.color
+        colorWell.target = self
+        colorWell.action = #selector(colorChanged)
+
+        let undoBtn = ActionButton(title: "Undo")
+        undoBtn.bezelStyle = .rounded
+        undoBtn.showsBorderOnlyWhileMouseInside = false
+        undoBtn.onClick = { [weak self] in self?.canvas.undo() }
+        undoBtn.sizeToFit()
+
+        let cancelBtn = ActionButton(title: "Cancel")
+        cancelBtn.bezelStyle = .rounded
+        cancelBtn.showsBorderOnlyWhileMouseInside = false
+        cancelBtn.keyEquivalent = "\u{1b}"
+        cancelBtn.onClick = { [weak self] in self?.window.close() }
+        cancelBtn.sizeToFit()
+
+        let doneBtn = ActionButton(title: "Done")
+        doneBtn.bezelStyle = .rounded
+        doneBtn.showsBorderOnlyWhileMouseInside = false
+        doneBtn.keyEquivalent = "\r"
+        doneBtn.onClick = { [weak self] in self?.saveAndClose() }
+        doneBtn.sizeToFit()
+
+        let container = EditorContainer(canvas: canvas, barHeight: barH,
+                                        barItems: [toolPicker, colorWell, undoBtn],
+                                        rightItems: [cancelBtn, doneBtn])
+        window.contentView = container
+        window.initialFirstResponder = canvas
+
+        canvas.onTextRequest = { [weak self] p in self?.beginText(at: p) }
+    }
+
+    func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func close() { window.close() }
+
+    private func saveAndClose() {
+        commitActiveField()
+        if let data = canvas.renderPNG() { onSave(data) }
+        window.close()
+    }
+
+    @objc private func toolChanged() {
+        commitActiveField()
+        canvas.tool = Tool(rawValue: toolPicker.selectedSegment) ?? .pen
+        window.makeFirstResponder(canvas)
+    }
+
+    @objc private func colorChanged() { canvas.color = colorWell.color }
+
+    // MARK: Text tool — overlay field, committed into an annotation
+
+    private func beginText(at imagePoint: NSPoint) {
+        commitActiveField()
+        pendingTextPoint = imagePoint
+        let fs = EditorCanvas.fontSize(for: canvas.image) * canvas.viewScale
+        let field = NSTextField(frame: NSRect(x: imagePoint.x * canvas.viewScale,
+                                              y: imagePoint.y * canvas.viewScale,
+                                              width: max(canvas.bounds.width - imagePoint.x * canvas.viewScale, 120),
+                                              height: fs + 10))
+        field.font = .boldSystemFont(ofSize: fs)
+        field.textColor = canvas.color
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .exterior
+        field.delegate = self
+        canvas.addSubview(field)
+        activeField = field
+        window.makeFirstResponder(field)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) { commitActiveField() }
+
+    private func commitActiveField() {
+        guard let field = activeField else { return }
+        activeField = nil
+        let text = field.stringValue
+        field.removeFromSuperview()
+        guard !text.isEmpty else { return }
+        canvas.annotations.append(.text(text, pendingTextPoint, canvas.color,
+                                        EditorCanvas.fontSize(for: canvas.image)))
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        activeField?.removeFromSuperview()
+        activeField = nil
+        NSColorPanel.shared.close()
+        onClosed?()
+    }
+}
+
+// Lays out the toolbar row on top and keeps the canvas aspect-fit centered below.
+final class EditorContainer: NSView {
+    private let canvas: EditorCanvas
+    private let barHeight: CGFloat
+    private let barItems: [NSView]
+    private let rightItems: [NSView]
+
+    init(canvas: EditorCanvas, barHeight: CGFloat, barItems: [NSView], rightItems: [NSView]) {
+        self.canvas = canvas
+        self.barHeight = barHeight
+        self.barItems = barItems
+        self.rightItems = rightItems
+        super.init(frame: .zero)
+        addSubview(canvas)
+        (barItems + rightItems).forEach { addSubview($0) }
+    }
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    override func layout() {
+        super.layout()
+        let barY = bounds.height - barHeight
+        var x: CGFloat = 12
+        for item in barItems {
+            var f = item.frame
+            if item is NSColorWell { f.size = NSSize(width: 44, height: 24) }
+            f.origin = NSPoint(x: x, y: barY + (barHeight - f.height) / 2)
+            item.frame = f
+            x += f.width + 10
+        }
+        var rx = bounds.width - 12
+        for item in rightItems.reversed() {
+            var f = item.frame
+            f.origin = NSPoint(x: rx - f.width, y: barY + (barHeight - f.height) / 2)
+            item.frame = f
+            rx -= f.width + 8
+        }
+
+        let img = canvas.image.size
+        let avail = NSRect(x: 0, y: 0, width: bounds.width, height: barY).insetBy(dx: 12, dy: 12)
+        guard img.width > 0, img.height > 0, avail.width > 0, avail.height > 0 else { return }
+        let s = min(avail.width / img.width, avail.height / img.height)
+        let size = NSSize(width: img.width * s, height: img.height * s)
+        canvas.frame = NSRect(x: avail.minX + (avail.width - size.width) / 2,
+                              y: avail.minY + (avail.height - size.height) / 2,
+                              width: size.width, height: size.height)
+    }
+}
+
+// MARK: - Thumbnail image view: drag out, click to dismiss
 
 final class ThumbView: NSView, NSDraggingSource {
     var image: NSImage { didSet { layer?.contents = image } }
     let fileURL: URL
     var onDismiss: (() -> Void)?
-    var onCrop: ((NSRect) -> Void)?
-    var cropMode = false {
-        didSet {
-            selectionBox.isHidden = true
-            window?.invalidateCursorRects(for: self)
-        }
-    }
-    private let selectionBox = NSView()
     private var downPoint = NSPoint.zero
     private var dragging = false
 
@@ -60,36 +453,18 @@ final class ThumbView: NSView, NSDraggingSource {
         wantsLayer = true
         layer?.contents = image
         layer?.contentsGravity = .resizeAspectFill
-        selectionBox.wantsLayer = true
-        selectionBox.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.25).cgColor
-        selectionBox.layer?.borderColor = NSColor.controlAccentColor.cgColor
-        selectionBox.layer?.borderWidth = 1
-        selectionBox.isHidden = true
-        addSubview(selectionBox)
     }
     required init?(coder: NSCoder) { fatalError("unused") }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    override func resetCursorRects() {
-        if cropMode { addCursorRect(bounds, cursor: .crosshair) }
-    }
-
     override func mouseDown(with event: NSEvent) {
-        downPoint = convert(event.locationInWindow, from: nil)
+        downPoint = event.locationInWindow
         dragging = false
-        if cropMode {
-            selectionBox.frame = NSRect(origin: downPoint, size: .zero)
-            selectionBox.isHidden = false
-        }
     }
 
     override func mouseDragged(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        if cropMode {
-            selectionBox.frame = rect(from: downPoint, to: p)
-            return
-        }
+        let p = event.locationInWindow
         guard !dragging, hypot(p.x - downPoint.x, p.y - downPoint.y) > 4 else { return }
         dragging = true
         // ponytail: drag payload is the file URL only — covers Finder, Slack, browsers,
@@ -100,17 +475,7 @@ final class ThumbView: NSView, NSDraggingSource {
     }
 
     override func mouseUp(with event: NSEvent) {
-        if cropMode {
-            let sel = selectionBox.frame
-            selectionBox.isHidden = true
-            if sel.width > 8, sel.height > 8 { onCrop?(sel) }
-            return
-        }
         if !dragging { onDismiss?() }   // click (no drag) dismisses
-    }
-
-    private func rect(from a: NSPoint, to b: NSPoint) -> NSRect {
-        NSRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
     }
 
     func draggingSession(_ session: NSDraggingSession,
@@ -134,6 +499,7 @@ final class ShelfItem: NSObject {
     private let markupBtn = ActionButton(title: "Markup")
     private let closeBtn = ActionButton(title: "✕")
     private var watcher: DispatchSourceFileSystemObject?
+    private var editor: EditorController?
 
     static func thumbSize(for image: NSImage) -> NSSize {
         let scale = min(1, maxThumbWidth / max(image.size.width, 1))
@@ -173,11 +539,9 @@ final class ShelfItem: NSObject {
         bar.state = .active
 
         thumbView.onDismiss = { [weak self] in self?.close() }
-        thumbView.onCrop = { [weak self] r in self?.crop(viewRect: r) }
-
         copyBtn.onClick = { [weak self] in self?.copyToClipboard() }
-        cropBtn.onClick = { [weak self] in self?.toggleCropMode() }
-        markupBtn.onClick = { [weak self] in self?.openInPreview() }
+        cropBtn.onClick = { [weak self] in self?.openEditor(tool: .crop) }
+        markupBtn.onClick = { [weak self] in self?.openEditor(tool: .pen) }
         closeBtn.onClick = { [weak self] in self?.close() }
 
         container.addSubview(thumbView)
@@ -212,7 +576,7 @@ final class ShelfItem: NSObject {
     private func copyToClipboard() {
         let pb = NSPasteboard.general
         pb.clearContents()
-        // Read from disk so markup edits saved in Preview are what gets copied.
+        // Read from disk so editor saves are what gets copied.
         let current = NSImage(contentsOf: url) ?? image
         pb.writeObjects([current, url as NSURL])
         copyBtn.title = "Copied ✓"
@@ -223,46 +587,30 @@ final class ShelfItem: NSObject {
         copyBtn.sizeToFit()
     }
 
-    private func toggleCropMode() {
-        thumbView.cropMode.toggle()
-        cropBtn.title = thumbView.cropMode ? "Cancel" : "Crop"
-        cropBtn.sizeToFit()
+    private func openEditor(tool: Tool) {
+        if let editor {
+            editor.show()
+            return
+        }
+        let current = NSImage(contentsOf: url) ?? image
+        let e = EditorController(image: current, tool: tool) { [weak self] data in
+            guard let self else { return }
+            try? data.write(to: self.url)   // watcher picks this up → thumb reloads + refits
+        }
+        e.onClosed = { [weak self] in self?.editor = nil }
+        editor = e
+        e.show()
     }
 
-    private func openInPreview() {
-        NSWorkspace.shared.open([url],
-                                withApplicationAt: URL(fileURLWithPath: "/System/Applications/Preview.app"),
-                                configuration: NSWorkspace.OpenConfiguration())
-    }
-
-    private func crop(viewRect r: NSRect) {
-        thumbView.cropMode = false
-        cropBtn.title = "Crop"
-        cropBtn.sizeToFit()
-
-        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
-        let vs = thumbView.bounds.size
-        let sx = CGFloat(cg.width) / max(vs.width, 1)
-        let sy = CGFloat(cg.height) / max(vs.height, 1)
-        // View coords are bottom-left origin, CGImage crop is top-left origin — flip y.
-        let pixelRect = CGRect(x: r.minX * sx,
-                               y: (vs.height - r.maxY) * sy,
-                               width: r.width * sx,
-                               height: r.height * sy).integral
-        guard pixelRect.width > 4, pixelRect.height > 4, let cropped = cg.cropping(to: pixelRect),
-              let png = NSBitmapImageRep(cgImage: cropped).representation(using: .png, properties: [:])
-        else { return }
-        try? png.write(to: url)   // watcher picks this up → thumb reloads + panel refits
-    }
-
-    private func close() {
+    func close() {
+        editor?.close()
         watcher?.cancel()
         watcher = nil
         panel.orderOut(nil)
         onClosed?(self)
     }
 
-    // MARK: File watcher — Preview saves land back on the thumbnail
+    // MARK: File watcher — editor saves land back on the thumbnail
 
     private func startWatching() {
         let fd = open(url.path, O_EVTONLY)
@@ -272,7 +620,7 @@ final class ShelfItem: NSObject {
         src.setEventHandler { [weak self] in
             guard let self, let w = self.watcher else { return }
             let flags = w.data
-            // Atomic saves (Preview) replace the file: re-arm the watch on the new inode.
+            // Atomic saves replace the file: re-arm the watch on the new inode.
             if flags.contains(.delete) || flags.contains(.rename) {
                 w.cancel()
                 self.watcher = nil
@@ -303,6 +651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var items: [ShelfItem] = []
     private var hotKeyRefs: [EventHotKeyRef?] = []
+    private var loginItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -317,15 +666,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         full.target = self
         let clear = NSMenuItem(title: "Dismiss All Thumbnails", action: #selector(dismissAll), keyEquivalent: "")
         clear.target = self
+        let restart = NSMenuItem(title: "Restart SnapShelf", action: #selector(restartApp), keyEquivalent: "r")
+        restart.target = self
+        loginItem = NSMenuItem(title: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
+        loginItem.target = self
         menu.addItem(area)
         menu.addItem(full)
         menu.addItem(.separator())
         menu.addItem(clear)
         menu.addItem(.separator())
+        menu.addItem(loginItem)
+        menu.addItem(restart)
         menu.addItem(NSMenuItem(title: "Quit SnapShelf", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
 
         registerHotkeys()
+
+        // Keep it always available: register as login item on first run.
+        if SMAppService.mainApp.status == .notRegistered { try? SMAppService.mainApp.register() }
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    @objc private func toggleLogin() {
+        if SMAppService.mainApp.status == .enabled {
+            try? SMAppService.mainApp.unregister()
+        } else {
+            try? SMAppService.mainApp.register()
+        }
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    @objc private func restartApp() {
+        let path = Bundle.main.bundlePath
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "sleep 0.5; /usr/bin/open \"\(path)\""]
+        try? p.run()
+        NSApp.terminate(nil)
     }
 
     // MARK: - Global hotkeys (Carbon — no Accessibility permission needed)
