@@ -760,20 +760,22 @@ final class ShelfItem: NSObject {
         }
     }
 
-    // Upload to 0x0.st (no account needed) and copy the URL. Anyone with the link
-    // can view it, so blur secrets first; files expire after ~30 days.
+    // Upload to litterbox (catbox.moe's temp host, no account needed) and copy the URL.
+    // Anyone with the link can view it, so blur secrets first; expires after 72 hours.
     private func shareLink() {
         linkBtn.title = "…"
         linkBtn.sizeToFit()
         layout()
         guard let fileData = try? Data(contentsOf: url) else { return }
-        var req = URLRequest(url: URL(string: "https://0x0.st")!)
+        var req = URLRequest(url: URL(string: "https://litterbox.catbox.moe/resources/internals/api.php")!)
         req.httpMethod = "POST"
         let boundary = "snapshelf-\(UUID().uuidString)"
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         req.setValue("SnapShelf/1.0", forHTTPHeaderField: "User-Agent")
         var body = Data()
-        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"\(url.lastPathComponent)\"\r\nContent-Type: image/png\r\n\r\n".data(using: .utf8)!)
+        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n".data(using: .utf8)!)
+        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"time\"\r\n\r\n72h\r\n".data(using: .utf8)!)
+        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"\(url.lastPathComponent)\"\r\nContent-Type: image/png\r\n\r\n".data(using: .utf8)!)
         body.append(fileData)
         body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
         URLSession.shared.uploadTask(with: req, from: body) { [weak self] data, response, _ in
@@ -1024,7 +1026,10 @@ final class HistoryWindow: NSObject {
                 guard let img = NSImage(contentsOf: f),
                       let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { continue }
                 let req = VNRecognizeTextRequest()
-                req.recognitionLevel = .fast   // indexing pass; the OCR button uses .accurate
+                // .accurate, not .fast — fast mode mangles screenshot text into
+                // garbage that no search query can match. Runs once per file.
+                req.recognitionLevel = .accurate
+                req.usesLanguageCorrection = true
                 try? VNImageRequestHandler(cgImage: cg).perform([req])
                 idx[f.lastPathComponent] = (req.results ?? [])
                     .compactMap { $0.topCandidates(1).first?.string }

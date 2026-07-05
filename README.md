@@ -16,8 +16,8 @@ Single Swift file, no dependencies, no Apple Developer account needed.
 - **Click** a thumbnail → big centered editor: pen, highlighter, arrow, box, text,
   blur/pixelate, crop — with per-stroke width (S/M/L), color picker, and full undo (⌘Z)
 - **OCR** button — on-device text recognition straight to the clipboard
-- **Link** button — uploads to [0x0.st](https://0x0.st) and copies a share URL
-  (public link, ~30-day expiry — blur secrets first)
+- **Link** button — uploads to [litterbox](https://litterbox.catbox.moe) and copies a
+  share URL (public link, 72-hour expiry — blur secrets first)
 - **History** window — searchable grid of every capture, including search by the
   *text inside* the screenshots (background OCR index)
 - Captures persist in `~/Pictures/SnapShelf/` (auto-cleaned after 60 days)
