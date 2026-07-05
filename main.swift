@@ -7,11 +7,25 @@
 
 import Cocoa
 import Carbon.HIToolbox
+import ImageIO
 import ServiceManagement
 import Vision
 
 private let maxThumbWidth: CGFloat = 320
 private let screenMargin: CGFloat = 16
+private let autoCleanupDays = 60   // captures older than this are deleted at launch
+
+// Newest-first list of every saved capture.
+private func capturedFiles() -> [URL] {
+    ((try? FileManager.default.contentsOfDirectory(at: saveDir,
+                                                   includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+        .filter { $0.pathExtension.lowercased() == "png" }
+        .sorted {
+            let da = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let db = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            return da > db
+        }
+}
 
 // All captures live here — survives reboots, browsable in Finder.
 private let saveDir: URL = {
@@ -48,10 +62,11 @@ final class ActionButton: NSButton {
 
 // MARK: - Annotations
 
-enum Tool: Int { case pen = 0, arrow, box, text, blur, crop }
+enum Tool: Int { case pen = 0, highlight, arrow, box, text, blur, crop }
 
 enum Annotation {
     case pen([NSPoint], NSColor)
+    case highlight([NSPoint], NSColor)   // wide translucent multiply stroke
     case arrow(NSPoint, NSPoint, NSColor)
     case box(NSRect, NSColor)
     case text(String, NSPoint, NSColor, CGFloat)
@@ -69,6 +84,20 @@ enum Annotation {
             p.move(to: pts[0])
             for pt in pts.dropFirst() { p.line(to: pt) }
             p.stroke()
+        case .highlight(let pts, let c):
+            guard pts.count > 1 else { return }
+            let cgc = NSGraphicsContext.current?.cgContext
+            cgc?.saveGState()
+            cgc?.setBlendMode(.multiply)
+            c.withAlphaComponent(0.45).setStroke()
+            let p = NSBezierPath()
+            p.lineWidth = lw
+            p.lineCapStyle = .round
+            p.lineJoinStyle = .round
+            p.move(to: pts[0])
+            for pt in pts.dropFirst() { p.line(to: pt) }
+            p.stroke()
+            cgc?.restoreGState()
         case .arrow(let a, let b, let c):
             c.setStroke()
             c.setFill()
@@ -111,6 +140,7 @@ enum Annotation {
         func t(_ p: NSPoint) -> NSPoint { NSPoint(x: p.x + d.x, y: p.y + d.y) }
         switch self {
         case .pen(let pts, let c): return .pen(pts.map(t), c)
+        case .highlight(let pts, let c): return .highlight(pts.map(t), c)
         case .arrow(let a, let b, let c): return .arrow(t(a), t(b), c)
         case .box(let r, let c): return .box(NSRect(origin: t(r.origin), size: r.size), c)
         case .text(let s, let p, let c, let f): return .text(s, t(p), c, f)
@@ -128,15 +158,20 @@ final class EditorCanvas: NSView {
             needsDisplay = true
         }
     }
-    var annotations: [Annotation] = [] { didSet { needsDisplay = true } }
+    struct Mark {
+        let a: Annotation
+        let width: CGFloat
+    }
+    var marks: [Mark] = [] { didSet { needsDisplay = true } }
     var tool: Tool = .pen
     var color: NSColor = .systemRed
+    var widthScale: CGFloat = 1   // set by the S/M/L picker
     var onTextRequest: ((NSPoint) -> Void)?   // image-point where user clicked with text tool
 
     // Undo stack: annotations undo one mark, crops restore the pre-crop state.
     private enum EditOp {
         case mark
-        case crop(NSImage, [Annotation])
+        case crop(NSImage, [Mark])
     }
     private var ops: [EditOp] = []
 
@@ -170,9 +205,15 @@ final class EditorCanvas: NSView {
         t.scale(by: viewScale)
         t.concat()
         image.draw(in: NSRect(origin: .zero, size: image.size))
-        let lw = Self.strokeWidth(for: image)
-        for a in annotations { a.draw(lineWidth: lw) }
-        if currentPen.count > 1 { Annotation.pen(currentPen, color).draw(lineWidth: lw) }
+        for m in marks { m.a.draw(lineWidth: m.width) }
+        let lw = Self.strokeWidth(for: image) * widthScale
+        if currentPen.count > 1 {
+            if tool == .highlight {
+                Annotation.highlight(currentPen, color).draw(lineWidth: lw * 5)
+            } else {
+                Annotation.pen(currentPen, color).draw(lineWidth: lw)
+            }
+        }
         if let s = dragStart, let c = dragCurrent {
             let r = rect(from: s, to: c)
             switch tool {
@@ -199,14 +240,14 @@ final class EditorCanvas: NSView {
         let p = toImage(event)
         switch tool {
         case .text: onTextRequest?(p)
-        case .pen: currentPen = [p]
+        case .pen, .highlight: currentPen = [p]
         default: dragStart = p; dragCurrent = p
         }
     }
 
     override func mouseDragged(with event: NSEvent) {
         let p = toImage(event)
-        if tool == .pen { currentPen.append(p) } else { dragCurrent = p }
+        if tool == .pen || tool == .highlight { currentPen.append(p) } else { dragCurrent = p }
         needsDisplay = true
     }
 
@@ -216,6 +257,8 @@ final class EditorCanvas: NSView {
         switch tool {
         case .pen:
             if currentPen.count > 1 { addMark(.pen(currentPen, color)) }
+        case .highlight:
+            if currentPen.count > 1 { addMark(.highlight(currentPen, color)) }
         case .arrow:
             if let s = dragStart, hypot(p.x - s.x, p.y - s.y) * viewScale > 6 {
                 addMark(.arrow(s, p, color))
@@ -250,17 +293,19 @@ final class EditorCanvas: NSView {
     }
 
     func addMark(_ a: Annotation) {
-        annotations.append(a)
+        var w = Self.strokeWidth(for: image) * widthScale
+        if case .highlight = a { w *= 5 }
+        marks.append(Mark(a: a, width: w))
         ops.append(.mark)
     }
 
     func undo() {
         switch ops.popLast() {
         case .mark:
-            _ = annotations.popLast()
-        case .crop(let prevImage, let prevAnnotations):
+            _ = marks.popLast()
+        case .crop(let prevImage, let prevMarks):
             image = prevImage
-            annotations = prevAnnotations
+            marks = prevMarks
         case nil:
             break
         }
@@ -273,9 +318,10 @@ final class EditorCanvas: NSView {
         let px = CGRect(x: r.minX * s, y: (image.size.height - r.maxY) * s,
                         width: r.width * s, height: r.height * s).integral
         guard px.width > 2, px.height > 2, let cropped = cg.cropping(to: px) else { return }
-        ops.append(.crop(image, annotations))
+        ops.append(.crop(image, marks))
         image = NSImage(cgImage: cropped, size: NSSize(width: px.width / s, height: px.height / s))
-        annotations = annotations.map { $0.translated(by: NSPoint(x: -r.minX, y: -r.minY)) }
+        let d = NSPoint(x: -r.minX, y: -r.minY)
+        marks = marks.map { Mark(a: $0.a.translated(by: d), width: $0.width) }
     }
 
     private func rect(from a: NSPoint, to b: NSPoint) -> NSRect {
@@ -319,8 +365,7 @@ final class EditorCanvas: NSView {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = ctx
         image.draw(in: NSRect(origin: .zero, size: image.size))
-        let lw = Self.strokeWidth(for: image)
-        for a in annotations { a.draw(lineWidth: lw) }
+        for m in marks { m.a.draw(lineWidth: m.width) }
         ctx.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()
         return rep.representation(using: .png, properties: [:])
@@ -333,6 +378,8 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     private let window: NSWindow
     private let canvas: EditorCanvas
     private let toolPicker: NSSegmentedControl
+    private let widthPicker = NSSegmentedControl(labels: ["S", "M", "L"],
+                                                 trackingMode: .selectOne, target: nil, action: nil)
     private let colorWell = NSColorWell()
     private let onSave: (Data) -> Void
     private var activeField: NSTextField?
@@ -343,7 +390,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         self.onSave = onSave
         canvas = EditorCanvas(image: image)
         canvas.tool = tool
-        toolPicker = NSSegmentedControl(labels: ["Pen", "Arrow", "Box", "Text", "Blur", "Crop"],
+        toolPicker = NSSegmentedControl(labels: ["Pen", "Highlight", "Arrow", "Box", "Text", "Blur", "Crop"],
                                         trackingMode: .selectOne, target: nil, action: nil)
         toolPicker.selectedSegment = tool.rawValue
 
@@ -365,6 +412,9 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
 
         toolPicker.target = self
         toolPicker.action = #selector(toolChanged)
+        widthPicker.selectedSegment = 1
+        widthPicker.target = self
+        widthPicker.action = #selector(widthChanged)
         colorWell.color = canvas.color
         colorWell.target = self
         colorWell.action = #selector(colorChanged)
@@ -390,7 +440,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         doneBtn.sizeToFit()
 
         let container = EditorContainer(canvas: canvas, barHeight: barH,
-                                        barItems: [toolPicker, colorWell, undoBtn],
+                                        barItems: [toolPicker, widthPicker, colorWell, undoBtn],
                                         rightItems: [cancelBtn, doneBtn])
         window.contentView = container
         window.initialFirstResponder = canvas
@@ -415,7 +465,15 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     @objc private func toolChanged() {
         commitActiveField()
         canvas.tool = Tool(rawValue: toolPicker.selectedSegment) ?? .pen
+        if canvas.tool == .highlight {   // highlighters are yellow until told otherwise
+            colorWell.color = .systemYellow
+            canvas.color = .systemYellow
+        }
         window.makeFirstResponder(canvas)
+    }
+
+    @objc private func widthChanged() {
+        canvas.widthScale = [0.6, 1, 2][max(widthPicker.selectedSegment, 0)]
     }
 
     @objc private func colorChanged() { canvas.color = colorWell.color }
@@ -570,6 +628,7 @@ final class ShelfItem: NSObject {
     private let ocrBtn = ActionButton(title: "OCR")
     private let cropBtn = ActionButton(title: "Crop")
     private let markupBtn = ActionButton(title: "Markup")
+    private let linkBtn = ActionButton(title: "Link")
     private let closeBtn = ActionButton(title: "✕")
     private var watcher: DispatchSourceFileSystemObject?
     private var editor: EditorController?
@@ -617,10 +676,11 @@ final class ShelfItem: NSObject {
         ocrBtn.onClick = { [weak self] in self?.runOCR() }
         cropBtn.onClick = { [weak self] in self?.openEditor(tool: .crop) }
         markupBtn.onClick = { [weak self] in self?.openEditor(tool: .pen) }
+        linkBtn.onClick = { [weak self] in self?.shareLink() }
         closeBtn.onClick = { [weak self] in self?.close() }
 
         container.addSubview(thumbView)
-        [copyBtn, ocrBtn, cropBtn, markupBtn, closeBtn].forEach { bar.addSubview($0) }
+        [copyBtn, ocrBtn, cropBtn, markupBtn, linkBtn, closeBtn].forEach { bar.addSubview($0) }
         container.addSubview(bar)
         panel.contentView = container
 
@@ -638,7 +698,7 @@ final class ShelfItem: NSObject {
         bar.frame = NSRect(x: 0, y: size.height, width: size.width, height: Self.barHeight)
 
         var x: CGFloat = 6
-        for btn in [copyBtn, ocrBtn, cropBtn, markupBtn] {
+        for btn in [copyBtn, ocrBtn, cropBtn, markupBtn, linkBtn] {
             btn.frame.origin = NSPoint(x: x, y: (Self.barHeight - btn.frame.height) / 2)
             x += btn.frame.width + 4
         }
@@ -698,6 +758,47 @@ final class ShelfItem: NSObject {
                 }
             }
         }
+    }
+
+    // Upload to 0x0.st (no account needed) and copy the URL. Anyone with the link
+    // can view it, so blur secrets first; files expire after ~30 days.
+    private func shareLink() {
+        linkBtn.title = "…"
+        linkBtn.sizeToFit()
+        layout()
+        guard let fileData = try? Data(contentsOf: url) else { return }
+        var req = URLRequest(url: URL(string: "https://0x0.st")!)
+        req.httpMethod = "POST"
+        let boundary = "snapshelf-\(UUID().uuidString)"
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        req.setValue("SnapShelf/1.0", forHTTPHeaderField: "User-Agent")
+        var body = Data()
+        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"\(url.lastPathComponent)\"\r\nContent-Type: image/png\r\n\r\n".data(using: .utf8)!)
+        body.append(fileData)
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        URLSession.shared.uploadTask(with: req, from: body) { [weak self] data, response, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let link = data.flatMap { String(data: $0, encoding: .utf8) }?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let link, link.hasPrefix("http"),
+                   (response as? HTTPURLResponse)?.statusCode == 200 {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(link, forType: .string)
+                    self.linkBtn.title = "Link ✓"
+                } else {
+                    self.linkBtn.title = "Failed"
+                }
+                self.linkBtn.sizeToFit()
+                self.layout()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    self.linkBtn.title = "Link"
+                    self.linkBtn.sizeToFit()
+                    self.layout()
+                }
+            }
+        }.resume()
     }
 
     private func openEditor(tool: Tool) {
@@ -764,6 +865,213 @@ final class ShelfItem: NSObject {
     }
 }
 
+// MARK: - History window: searchable grid of every capture
+
+final class HistoryCell: NSView, NSDraggingSource {
+    let url: URL
+    var onPin: ((URL) -> Void)?
+    private var downPoint = NSPoint.zero
+    private var dragging = false
+
+    init(url: URL) {
+        self.url = url
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
+        layer?.contentsGravity = .resizeAspectFill
+        toolTip = url.deletingPathExtension().lastPathComponent
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let opts: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: 400,
+            ]
+            guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+            else { return }
+            let img = NSImage(cgImage: cg, size: .zero)
+            DispatchQueue.main.async { self?.layer?.contents = img }
+        }
+    }
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        downPoint = event.locationInWindow
+        dragging = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let p = event.locationInWindow
+        guard !dragging, hypot(p.x - downPoint.x, p.y - downPoint.y) > 4 else { return }
+        dragging = true
+        let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+        item.setDraggingFrame(bounds, contents: layer?.contents)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if !dragging { onPin?(url) }
+    }
+
+    func draggingSession(_ session: NSDraggingSession,
+                         sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
+}
+
+final class HistoryGrid: NSView {
+    var onPin: ((URL) -> Void)?
+    private let cellSize = NSSize(width: 168, height: 116)
+    private let gap: CGFloat = 10
+
+    override var isFlipped: Bool { true }   // newest capture top-left
+
+    func show(urls: [URL]) {
+        subviews.forEach { $0.removeFromSuperview() }
+        for u in urls {
+            let c = HistoryCell(url: u)
+            c.onPin = { [weak self] in self?.onPin?($0) }
+            addSubview(c)
+        }
+        relayout()
+    }
+
+    func relayout() {
+        let w = max(bounds.width, cellSize.width + 2 * gap)
+        let cols = max(Int((w - gap) / (cellSize.width + gap)), 1)
+        for (i, v) in subviews.enumerated() {
+            let row = i / cols, col = i % cols
+            v.frame = NSRect(x: gap + CGFloat(col) * (cellSize.width + gap),
+                             y: gap + CGFloat(row) * (cellSize.height + gap),
+                             width: cellSize.width, height: cellSize.height)
+        }
+        let rows = (subviews.count + cols - 1) / cols
+        setFrameSize(NSSize(width: w, height: gap + CGFloat(max(rows, 1)) * (cellSize.height + gap)))
+    }
+
+    override func resize(withOldSuperviewSize oldSize: NSSize) {
+        super.resize(withOldSuperviewSize: oldSize)
+        relayout()
+    }
+}
+
+final class HistoryWindow: NSObject {
+    var onPin: ((URL) -> Void)? { didSet { grid.onPin = onPin } }
+
+    private let window: NSWindow
+    private let search = NSSearchField()
+    private let grid = HistoryGrid()
+    private let scroll = NSScrollView()
+    private var index: [String: String] = [:]   // filename → recognized text
+    private var indexing = false
+    private let indexURL = saveDir.appendingPathComponent(".ocr-index.json")
+
+    override init() {
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 540),
+                          styleMask: [.titled, .closable, .resizable],
+                          backing: .buffered, defer: false)
+        super.init()
+        window.title = "SnapShelf History"
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 420, height: 300)
+
+        search.placeholderString = "Search text inside screenshots"
+        search.target = self
+        search.action = #selector(searchChanged)
+        search.isContinuous = true
+
+        scroll.documentView = grid
+        scroll.hasVerticalScroller = true
+        grid.autoresizingMask = [.width]
+
+        let container = HistoryContainer(search: search, scroll: scroll)
+        window.contentView = container
+    }
+
+    func open() {
+        NSApp.activate(ignoringOtherApps: true)
+        if !window.isVisible { window.center() }
+        window.makeKeyAndOrderFront(nil)
+        index = loadIndex()
+        reload()
+        buildIndex()
+    }
+
+    @objc private func searchChanged() { reload() }
+
+    private func reload() {
+        let q = search.stringValue.lowercased()
+        var urls = capturedFiles()
+        if !q.isEmpty {
+            urls = urls.filter {
+                $0.lastPathComponent.lowercased().contains(q)
+                    || (index[$0.lastPathComponent]?.lowercased().contains(q) ?? false)
+            }
+        }
+        grid.show(urls: urls)
+    }
+
+    // OCR every un-indexed capture in the background so search-by-content works.
+    private func buildIndex() {
+        guard !indexing else { return }
+        indexing = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            var idx = self.loadIndex()
+            var changed = false
+            for f in capturedFiles() where idx[f.lastPathComponent] == nil {
+                guard let img = NSImage(contentsOf: f),
+                      let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { continue }
+                let req = VNRecognizeTextRequest()
+                req.recognitionLevel = .fast   // indexing pass; the OCR button uses .accurate
+                try? VNImageRequestHandler(cgImage: cg).perform([req])
+                idx[f.lastPathComponent] = (req.results ?? [])
+                    .compactMap { $0.topCandidates(1).first?.string }
+                    .joined(separator: " ")
+                changed = true
+            }
+            if changed, let data = try? JSONEncoder().encode(idx) {
+                try? data.write(to: self.indexURL)
+            }
+            DispatchQueue.main.async {
+                self.index = idx
+                self.indexing = false
+                if !self.search.stringValue.isEmpty { self.reload() }
+            }
+        }
+    }
+
+    private func loadIndex() -> [String: String] {
+        guard let data = try? Data(contentsOf: indexURL),
+              let idx = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
+        return idx
+    }
+}
+
+final class HistoryContainer: NSView {
+    private let search: NSSearchField
+    private let scroll: NSScrollView
+
+    init(search: NSSearchField, scroll: NSScrollView) {
+        self.search = search
+        self.scroll = scroll
+        super.init(frame: .zero)
+        addSubview(search)
+        addSubview(scroll)
+    }
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    override func layout() {
+        super.layout()
+        let pad: CGFloat = 10
+        search.frame = NSRect(x: pad, y: bounds.height - 28 - pad,
+                              width: bounds.width - 2 * pad, height: 28)
+        scroll.frame = NSRect(x: 0, y: 0, width: bounds.width,
+                              height: bounds.height - 28 - 2 * pad)
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -772,6 +1080,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotKeyRefs: [EventHotKeyRef?] = []
     private var loginItem: NSMenuItem!
     private let recentMenu = NSMenu()
+    private let history = HistoryWindow()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -793,10 +1102,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let recent = NSMenuItem(title: "Recent Captures", action: nil, keyEquivalent: "")
         recentMenu.delegate = self
         recent.submenu = recentMenu
+        let historyItem = NSMenuItem(title: "History…", action: #selector(openHistory), keyEquivalent: "")
+        historyItem.target = self
         menu.addItem(area)
         menu.addItem(full)
         menu.addItem(.separator())
         menu.addItem(recent)
+        menu.addItem(historyItem)
         menu.addItem(clear)
         menu.addItem(.separator())
         menu.addItem(loginItem)
@@ -809,6 +1121,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Keep it always available: register as login item on first run.
         if SMAppService.mainApp.status == .notRegistered { try? SMAppService.mainApp.register() }
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+
+        history.onPin = { [weak self] url in self?.showThumb(for: url) }
+        cleanupOldCaptures()
+    }
+
+    @objc private func openHistory() { history.open() }
+
+    private func cleanupOldCaptures() {
+        DispatchQueue.global(qos: .utility).async {
+            let cutoff = Date().addingTimeInterval(-Double(autoCleanupDays) * 86400)
+            for f in capturedFiles() {
+                let d = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                if let d, d < cutoff { try? FileManager.default.removeItem(at: f) }
+            }
+        }
     }
 
     @objc private func toggleLogin() {
@@ -913,15 +1240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === recentMenu else { return }
         menu.removeAllItems()
-        let fm = FileManager.default
-        let files = ((try? fm.contentsOfDirectory(at: saveDir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
-            .filter { $0.pathExtension.lowercased() == "png" }
-            .sorted {
-                let da = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-                let db = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-                return da > db
-            }
-            .prefix(10)
+        let files = capturedFiles().prefix(10)
         if files.isEmpty {
             menu.addItem(NSMenuItem(title: "No captures yet", action: nil, keyEquivalent: ""))
         }
