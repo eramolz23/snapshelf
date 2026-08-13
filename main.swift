@@ -1,5 +1,5 @@
 // SnapShelf — minimal screenshot shelf for macOS.
-// Hotkeys: ⇧⌘2 or ⌃⇧2 area capture, ⇧⌘1 or ⌃⇧1 full screen. Also via menu bar icon.
+// Hotkeys: ⌃⌘2 area capture, ⌃⌘1 full screen. Also via menu bar icon.
 // Thumbnail floats bottom-left with a toolbar (Copy / Crop / Markup / ✕); ✕ dismisses.
 // Drag the image into any window to drop the PNG. Clicking the image, Markup, or Crop
 // opens a big centered in-app editor: pen, arrow, box, text, color, undo, crop.
@@ -36,12 +36,10 @@ private let saveDir: URL = {
 }()
 
 // Hotkeys — edit here, rebuild with build.sh. id 1 = area capture, id 2 = full screen.
-// Two combos per action: ⇧⌘ (matches system screenshot muscle memory) and ⌃⇧ (conflict-free fallback).
+// Command-Control shortcuts avoid conflicts with macOS system screenshot hotkeys.
 private let hotkeys: [(keyCode: Int, modifiers: Int, id: UInt32)] = [
-    (kVK_ANSI_2, cmdKey | shiftKey, 1),
-    (kVK_ANSI_1, cmdKey | shiftKey, 2),
-    (kVK_ANSI_2, controlKey | shiftKey, 1),
-    (kVK_ANSI_1, controlKey | shiftKey, 2),
+    (kVK_ANSI_2, cmdKey | controlKey, 1),
+    (kVK_ANSI_1, cmdKey | controlKey, 2),
 ]
 
 final class ActionButton: NSButton {
@@ -1159,10 +1157,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                            accessibilityDescription: "SnapShelf")
         let menu = NSMenu()
         let area = NSMenuItem(title: "Capture Area", action: #selector(captureArea), keyEquivalent: "2")
-        area.keyEquivalentModifierMask = [.command, .shift]
+        area.keyEquivalentModifierMask = [.command, .control]
         area.target = self
         let full = NSMenuItem(title: "Capture Full Screen", action: #selector(captureFull), keyEquivalent: "1")
-        full.keyEquivalentModifierMask = [.command, .shift]
+        full.keyEquivalentModifierMask = [.command, .control]
         full.target = self
         let clear = NSMenuItem(title: "Dismiss All Thumbnails", action: #selector(dismissAll), keyEquivalent: "")
         clear.target = self

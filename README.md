@@ -8,8 +8,8 @@ Single Swift file, no dependencies, no Apple Developer account needed.
 
 ## Features
 
-- **Capture**: `⌃⇧2` / `⇧⌘2` area (press **Space** during selection for window capture),
-  `⌃⇧1` / `⇧⌘1` full screen, or use the menu bar icon
+- **Capture**: `⌃⌘2` area (press **Space** during selection for window capture),
+  `⌃⌘1` full screen, or use the menu bar icon
 - **Pinned thumbnails** stack bottom-left and stay until dismissed (✕)
 - **Auto-copy** — every capture is on the clipboard immediately
 - **Drag** a thumbnail into any window (Slack, Finder, mail…) to drop the PNG
