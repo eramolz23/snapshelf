@@ -3,3 +3,4 @@ SnapShelf
 dist/
 graphify-out/
 .worktrees/
+.claude/
