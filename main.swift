@@ -463,6 +463,15 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         window.contentView = container
         window.initialFirstResponder = canvas
 
+        // Never narrower than the toolbar: a narrow capture used to open a 480pt window
+        // with Undo past the right edge and Cancel/Done drawn over the S/M/L picker.
+        let barMin = 12 + toolPicker.frame.width + 10 + widthPicker.frame.width + 10 + 44 + 10
+            + undoBtn.frame.width + 10 + 24 + cancelBtn.frame.width + 8 + doneBtn.frame.width + 12
+        if content.width < barMin {
+            window.setContentSize(NSSize(width: barMin, height: content.height))
+        }
+        window.minSize = NSSize(width: barMin, height: barH + 160)
+
         canvas.onTextRequest = { [weak self] p in self?.beginText(at: p) }
     }
 
@@ -608,7 +617,10 @@ final class ThumbView: NSView, NSDraggingSource {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.contents = preview
-        layer?.contentsGravity = .resizeAspectFill
+        // Aspect-fit, not fill: a narrow capture sits centered in a panel that is
+        // as wide as the toolbar needs, instead of being cropped to fill it.
+        layer?.contentsGravity = .resizeAspect
+        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
     }
     required init?(coder: NSCoder) { fatalError("unused") }
 
@@ -725,8 +737,16 @@ final class ShelfItem: NSObject {
         startWatching()
     }
 
+    // The toolbar's natural width. The panel never goes narrower, so a narrow capture
+    // can't push Link/✕ off the edge (✕ used to land on top of Crop).
+    private var barMinWidth: CGFloat {
+        let left = [copyBtn, ocrBtn, cropBtn, markupBtn, linkBtn].reduce(CGFloat(6)) { $0 + $1.frame.width + 4 }
+        return left + 4 + closeBtn.frame.width + 6
+    }
+
     private func layout() {
-        let size = ShelfItem.thumbSize(for: imageSize)
+        let fit = ShelfItem.thumbSize(for: imageSize)
+        let size = NSSize(width: max(fit.width, barMinWidth), height: fit.height)
         var frame = panel.frame
         frame.size = NSSize(width: size.width, height: size.height + Self.barHeight)
         panel.setFrame(frame, display: true)   // origin fixed → stays anchored bottom-left
