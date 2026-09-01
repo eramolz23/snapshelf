@@ -35,6 +35,21 @@ private let saveDir: URL = {
     return d
 }()
 
+// Decode a downsampled copy straight from disk via ImageIO. `maxPixel` bounds the longer
+// side. Used everywhere a preview is drawn so the full-res bitmap (60MB for a 5K shot)
+// never sits in a layer or a menu.
+private func downsampledImage(at url: URL, maxPixel: CGFloat) -> NSImage? {
+    let opts: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: Int(maxPixel),
+    ]
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+    return NSImage(cgImage: cg, size: .zero)
+}
+
 // Hotkeys — edit here, rebuild with build.sh. id 1 = area capture, id 2 = full screen.
 // Command-Control shortcuts avoid conflicts with macOS system screenshot hotkeys.
 private let hotkeys: [(keyCode: Int, modifiers: Int, id: UInt32)] = [
@@ -580,18 +595,19 @@ final class EditorContainer: NSView {
 // MARK: - Thumbnail image view: drag out, click to dismiss
 
 final class ThumbView: NSView, NSDraggingSource {
-    var image: NSImage { didSet { layer?.contents = image } }
+    // Downsampled preview only — the full-res capture stays on disk.
+    var preview: NSImage { didSet { layer?.contents = preview } }
     let fileURL: URL
     var onClick: (() -> Void)?
     private var downPoint = NSPoint.zero
     private var dragging = false
 
-    init(image: NSImage, fileURL: URL) {
-        self.image = image
+    init(preview: NSImage, fileURL: URL) {
+        self.preview = preview
         self.fileURL = fileURL
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.contents = image
+        layer?.contents = preview
         layer?.contentsGravity = .resizeAspectFill
     }
     required init?(coder: NSCoder) { fatalError("unused") }
@@ -610,7 +626,7 @@ final class ThumbView: NSView, NSDraggingSource {
         // ponytail: drag payload is the file URL only — covers Finder, Slack, browsers,
         // mail, chat. Add an NSImage writer too if some app refuses file drops.
         let item = NSDraggingItem(pasteboardWriter: fileURL as NSURL)
-        item.setDraggingFrame(bounds, contents: image)
+        item.setDraggingFrame(bounds, contents: preview)
         beginDraggingSession(with: [item], event: event, source: self)
     }
 
@@ -630,8 +646,10 @@ final class ShelfItem: NSObject {
     let panel: NSPanel
     let url: URL
     var onClosed: ((ShelfItem) -> Void)?
+    var onSaved: ((URL) -> Void)?   // editor wrote a new version of the file
 
-    private var image: NSImage
+    // Only the point size is kept; the pixels live on disk and in the downsampled preview.
+    private var imageSize: NSSize
     private let thumbView: ThumbView
     private let bar = NSVisualEffectView()
     private let copyBtn = ActionButton(title: "Copy")
@@ -644,18 +662,27 @@ final class ShelfItem: NSObject {
     private var editor: EditorController?
     private var closed = false
 
-    static func thumbSize(for image: NSImage) -> NSSize {
-        let scale = min(1, maxThumbWidth / max(image.size.width, 1))
-        return NSSize(width: max(image.size.width * scale, 60),
-                      height: max(image.size.height * scale, 40))
+    static func thumbSize(for imageSize: NSSize) -> NSSize {
+        let scale = min(1, maxThumbWidth / max(imageSize.width, 1))
+        return NSSize(width: max(imageSize.width * scale, 60),
+                      height: max(imageSize.height * scale, 40))
+    }
+
+    // Retina-sharp at thumb size, nothing bigger. Falls back to the full image only if
+    // ImageIO can't read the file (then it's the old behavior, not a blank thumb).
+    private static func preview(for url: URL, imageSize: NSSize, fallback: NSImage) -> NSImage {
+        let size = thumbSize(for: imageSize)
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        return downsampledImage(at: url, maxPixel: max(size.width, size.height) * scale) ?? fallback
     }
 
     init(url: URL, image: NSImage, origin: NSPoint) {
         self.url = url
-        self.image = image
-        self.thumbView = ThumbView(image: image, fileURL: url)
+        self.imageSize = image.size
+        self.thumbView = ThumbView(preview: ShelfItem.preview(for: url, imageSize: image.size, fallback: image),
+                                   fileURL: url)
 
-        let size = ShelfItem.thumbSize(for: image)
+        let size = ShelfItem.thumbSize(for: image.size)
         let total = NSSize(width: size.width, height: size.height + ShelfItem.barHeight)
         panel = NSPanel(contentRect: NSRect(origin: origin, size: total),
                         styleMask: [.borderless, .nonactivatingPanel],
@@ -699,7 +726,7 @@ final class ShelfItem: NSObject {
     }
 
     private func layout() {
-        let size = ShelfItem.thumbSize(for: image)
+        let size = ShelfItem.thumbSize(for: imageSize)
         var frame = panel.frame
         frame.size = NSSize(width: size.width, height: size.height + Self.barHeight)
         panel.setFrame(frame, display: true)   // origin fixed → stays anchored bottom-left
@@ -722,7 +749,7 @@ final class ShelfItem: NSObject {
         let pb = NSPasteboard.general
         pb.clearContents()
         // Read from disk so editor saves are what gets copied.
-        let current = NSImage(contentsOf: url) ?? image
+        guard let current = NSImage(contentsOf: url) else { return }
         pb.writeObjects([current, url as NSURL])
         copyBtn.title = "Copied ✓"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
@@ -818,10 +845,11 @@ final class ShelfItem: NSObject {
             editor.show()
             return
         }
-        let current = NSImage(contentsOf: url) ?? image
+        guard let current = NSImage(contentsOf: url) else { return }
         let e = EditorController(image: current, tool: tool) { [weak self] data in
             guard let self else { return }
             try? data.write(to: self.url)   // watcher picks this up → thumb reloads + refits
+            self.onSaved?(self.url)         // re-OCR: blurred text must leave the search index
         }
         e.onClosed = { [weak self] in
             guard let self, !self.closed else { return }
@@ -871,8 +899,8 @@ final class ShelfItem: NSObject {
 
     private func reloadFromDisk() {
         guard let img = NSImage(contentsOf: url) else { return }
-        image = img
-        thumbView.image = img
+        imageSize = img.size
+        thumbView.preview = ShelfItem.preview(for: url, imageSize: img.size, fallback: img)
         layout()
     }
 }
@@ -895,14 +923,7 @@ final class HistoryCell: NSView, NSDraggingSource {
         layer?.contentsGravity = .resizeAspectFill
         toolTip = url.deletingPathExtension().lastPathComponent
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let opts: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceThumbnailMaxPixelSize: 400,
-            ]
-            guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-                  let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
-            else { return }
-            let img = NSImage(cgImage: cg, size: .zero)
+            guard let img = downsampledImage(at: url, maxPixel: 400) else { return }
             DispatchQueue.main.async { self?.layer?.contents = img }
         }
     }
@@ -977,6 +998,7 @@ final class HistoryWindow: NSObject {
     private let grid = HistoryGrid()
     private let scroll = NSScrollView()
     private var index: [String: String] = [:]   // filename → recognized text
+    private var indexGen: [String: Int] = [:]   // bumped per reindex; stale OCR results are dropped
     private var indexing = false
     private let indexURL = saveDir.appendingPathComponent(".ocr-index.json")
 
@@ -985,6 +1007,9 @@ final class HistoryWindow: NSObject {
                           styleMask: [.titled, .closable, .resizable],
                           backing: .buffered, defer: false)
         super.init()
+        // Loaded at launch, not on first open: prune()/reindex() run before the window
+        // is ever shown, and saving an empty in-memory index would wipe the file.
+        index = loadIndex()
         window.title = "SnapShelf History"
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 420, height: 300)
@@ -1012,7 +1037,7 @@ final class HistoryWindow: NSObject {
         NSApp.activate(ignoringOtherApps: true)
         if !window.isVisible { window.center() }
         window.makeKeyAndOrderFront(nil)
-        index = loadIndex()
+        prune()
         reload()
         buildIndex()
     }
@@ -1075,15 +1100,35 @@ final class HistoryWindow: NSObject {
 
     // Called on every new capture so search is current without reopening the window.
     func indexFile(_ url: URL) {
-        guard index[url.lastPathComponent] == nil else { return }
+        let name = url.lastPathComponent
+        guard index[name] == nil else { return }
+        let gen = indexGen[name, default: 0]
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let text = HistoryWindow.recognizeText(in: url) else { return }
             DispatchQueue.main.async {
-                guard let self else { return }
-                self.index[url.lastPathComponent] = text
+                guard let self, self.indexGen[name, default: 0] == gen else { return }
+                self.index[name] = text
                 self.saveIndex()
             }
         }
+    }
+
+    // The file changed under an existing entry (editor save). Drop the old text NOW so a
+    // blurred secret is unsearchable immediately, then OCR the new pixels.
+    func reindex(_ url: URL) {
+        let name = url.lastPathComponent
+        indexGen[name, default: 0] += 1
+        index[name] = nil
+        saveIndex()
+        indexFile(url)
+    }
+
+    // Text must not outlive its screenshot (60-day cleanup, manual deletes in Finder).
+    func prune() {
+        let live = Set(capturedFiles().map { $0.lastPathComponent })
+        let before = index.count
+        index = index.filter { live.contains($0.key) }
+        if index.count != before { saveIndex() }
     }
 
     // OCR every un-indexed capture in the background so search-by-content works.
@@ -1098,7 +1143,10 @@ final class HistoryWindow: NSObject {
                 idx[f.lastPathComponent] = HistoryWindow.recognizeText(in: f) ?? ""
             }
             DispatchQueue.main.async {
-                self.index.merge(idx) { _, new in new }
+                // In-memory wins: a reindex() that landed mid-build is fresher than the
+                // disk snapshot this pass started from.
+                self.index.merge(idx) { current, _ in current }
+                self.prune()
                 self.saveIndex()
                 self.indexing = false
                 self.window.title = "SnapShelf History"
@@ -1150,6 +1198,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var loginItem: NSMenuItem!
     private let recentMenu = NSMenu()
     private let history = HistoryWindow()
+    // Recent Captures icons. Keyed on path + mtime so an editor save invalidates the entry.
+    private var menuThumbs: [String: NSImage] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -1202,8 +1252,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func openSearchPreview(url: URL, query: String) {
         guard let image = NSImage(contentsOf: url) else { return }
-        let e = EditorController(image: image, tool: .pen) { data in
+        let e = EditorController(image: image, tool: .pen) { [weak self] data in
             try? data.write(to: url)
+            self?.history.reindex(url)
         }
         e.onClosed = { [weak self, weak e] in
             self?.previewEditors.removeAll { $0 === e }
@@ -1224,6 +1275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let d = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
                 if let d, d < cutoff { try? FileManager.default.removeItem(at: f) }
             }
+            DispatchQueue.main.async { [weak self] in self?.history.prune() }
         }
     }
 
@@ -1315,6 +1367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.onClosed = { [weak self] it in
             self?.items.removeAll { $0 === it }
         }
+        item.onSaved = { [weak self] in self?.history.reindex($0) }
         item.panel.orderFrontRegardless()
         items.append(item)
 
@@ -1324,6 +1377,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pb.writeObjects([image, url as NSURL])
 
         history.indexFile(url)   // searchable right away, no window reopen needed
+        loadMenuThumb(for: url, into: nil)   // warm the Recent Captures icon off the main thread
+    }
+
+    private func menuThumbKey(_ f: URL) -> String {
+        let m = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        return "\(f.path)|\(m?.timeIntervalSince1970 ?? 0)"
+    }
+
+    // ImageIO thumbnail on a background queue, cached; the menu item (if any) is filled in
+    // when it lands. The old path decoded ten full-res PNGs on the main thread per menu open.
+    private func loadMenuThumb(for f: URL, into item: NSMenuItem?) {
+        let key = menuThumbKey(f)
+        if let cached = menuThumbs[key] { item?.image = cached; return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let img = downsampledImage(at: f, maxPixel: 128) else { return }
+            let h: CGFloat = 32
+            img.size = NSSize(width: max(h * img.size.width / max(img.size.height, 1), 8), height: h)
+            DispatchQueue.main.async {
+                self?.menuThumbs[key] = img
+                item?.image = img
+            }
+        }
     }
 
     // MARK: - Recent captures submenu (rebuilt each time the menu opens)
@@ -1340,17 +1415,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 action: #selector(rePin(_:)), keyEquivalent: "")
             mi.target = self
             mi.representedObject = f
-            if let img = NSImage(contentsOf: f) {
-                let h: CGFloat = 32
-                let w = max(h * img.size.width / max(img.size.height, 1), 8)
-                let thumb = NSImage(size: NSSize(width: w, height: h))
-                thumb.lockFocus()
-                img.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
-                thumb.unlockFocus()
-                mi.image = thumb
-            }
+            loadMenuThumb(for: f, into: mi)
             menu.addItem(mi)
         }
+        let live = Set(files.map(menuThumbKey))
+        menuThumbs = menuThumbs.filter { live.contains($0.key) }
         menu.addItem(.separator())
         let folder = NSMenuItem(title: "Open Captures Folder", action: #selector(openFolder), keyEquivalent: "")
         folder.target = self
