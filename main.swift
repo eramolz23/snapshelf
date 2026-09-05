@@ -16,8 +16,8 @@ private let screenMargin: CGFloat = 16
 private let autoCleanupDays = 60   // captures older than this are deleted at launch
 
 // Newest-first list of every saved capture.
-private func capturedFiles() -> [URL] {
-    ((try? FileManager.default.contentsOfDirectory(at: saveDir,
+private func capturedFiles(in directory: URL = saveDir) -> [URL] {
+    ((try? FileManager.default.contentsOfDirectory(at: directory,
                                                    includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
         .filter { $0.pathExtension.lowercased() == "png" }
         .sorted {
@@ -34,6 +34,209 @@ private let saveDir: URL = {
     try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
     return d
 }()
+
+// File identity includes nanosecond timestamps: same-name replacements and rapid edits
+// invalidate background OCR even when the file size or second-level mtime is unchanged.
+private func fileRevision(_ url: URL) -> String? {
+    var info = stat()
+    guard stat(url.path, &info) == 0 else { return nil }
+    return "\(info.st_ino):\(info.st_size):\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec)"
+}
+
+final class CaptureClipboard {
+    private let pasteboard: NSPasteboard
+    private var owner: URL?
+    private var changeCount = -1
+    var currentChangeCount: Int { pasteboard.changeCount }
+
+    init(pasteboard: NSPasteboard = .general) { self.pasteboard = pasteboard }
+
+    func copy(_ url: URL) {
+        guard let image = NSImage(contentsOf: url) else { return }
+        pasteboard.clearContents()
+        if pasteboard.writeObjects([image, url as NSURL]) {
+            owner = url
+            changeCount = pasteboard.changeCount
+        } else { owner = nil }
+    }
+
+    func refreshAfterSave(_ url: URL) {
+        guard owner == url, pasteboard.changeCount == changeCount else { return }
+        copy(url)
+    }
+
+    func copyText(_ text: String, from url: URL? = nil) {
+        pasteboard.clearContents()
+        if pasteboard.setString(text, forType: .string) {
+            owner = url
+            changeCount = pasteboard.changeCount
+        } else { owner = nil }
+    }
+}
+
+private enum CaptureFiles {
+    static func destination(in directory: URL, date: Date = Date()) -> URL {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        return directory.appendingPathComponent("Screenshot \(df.string(from: date)) \(UUID().uuidString).png")
+    }
+
+    static func succeeded(at url: URL, status: Int32, reason: Process.TerminationReason) -> Bool {
+        status == 0 && reason == .exit && NSImage(contentsOf: url) != nil
+    }
+
+    static func save(_ data: Data, to url: URL) throws {
+        // A deleted screenshot must not be silently resurrected by an open editor.
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: url.path])
+        }
+        try data.write(to: url, options: .atomic)
+    }
+}
+
+private enum LoginPreference {
+    static let key = "startAtLogin"
+    static func registerOnLaunch(defaults: UserDefaults, status: SMAppService.Status) -> Bool {
+        if defaults.object(forKey: key) == nil {
+            // An absent preference cannot distinguish first launch from an older
+            // installation whose owner switched login off. Preserve the OS choice.
+            let enabled = status == .enabled || status == .requiresApproval
+            defaults.set(enabled, forKey: key)
+        }
+        return defaults.bool(forKey: key) && status == .notRegistered
+    }
+}
+
+// Main-thread state; OCR workers return individual entries, never a stale disk snapshot.
+final class CaptureIndex {
+    private struct Entry: Codable { let revision: String; let text: String }
+    private struct Cache: Codable { let version: Int; let entries: [String: Entry] }
+    private let directory: URL
+    private let indexURL: URL
+    private let recognize: (URL) -> String?
+    private let workerQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
+    private var entries: [String: Entry] = [:]
+    private var generations: [String: Int] = [:]
+    private var pending: [String: Int] = [:]
+    private var changeNotificationPending = false
+    var onChange: (() -> Void)?
+    var onError: ((Error) -> Void)?
+    var isIndexing: Bool { !pending.isEmpty }
+
+    init(directory: URL, recognize: @escaping (URL) -> String? = HistoryWindow.recognizeText) {
+        self.directory = directory
+        self.indexURL = directory.appendingPathComponent(".ocr-index.json")
+        self.recognize = recognize
+        if let data = try? Data(contentsOf: indexURL),
+           let cache = try? JSONDecoder().decode(Cache.self, from: data), cache.version == 2 {
+            entries = cache.entries
+        }
+        // Legacy filename-only caches cannot prove which pixels their text came from.
+        // Rewrite immediately so previously removed secrets do not survive migration.
+        do { try prune(); try save() }
+        catch { report(error) }
+    }
+
+    func text(for url: URL) -> String? {
+        guard let entry = entries[url.lastPathComponent], entry.revision == fileRevision(url) else { return nil }
+        return entry.text
+    }
+
+    func indexFile(_ url: URL) {
+        let name = url.lastPathComponent
+        guard text(for: url) == nil, let revision = fileRevision(url) else { return }
+        let generation = generations[name, default: 0]
+        guard pending[name] != generation else { return }
+        pending[name] = generation
+        notifyChange()
+        let recognize = self.recognize
+        workerQueue.addOperation { [weak self] in
+            let text = recognize(url)
+            DispatchQueue.main.async {
+                guard let self, self.generations[name, default: 0] == generation else { return }
+                self.pending[name] = nil
+                guard fileRevision(url) == revision else {
+                    do { try self.reindex(url) }
+                    catch { self.report(error) }
+                    return
+                }
+                if let text { self.entries[name] = Entry(revision: revision, text: text) }
+                do { try self.save() }
+                catch { self.report(error) }
+                self.notifyChange()
+            }
+        }
+    }
+
+    private func invalidate(_ url: URL) throws {
+        let name = url.lastPathComponent
+        generations[name, default: 0] += 1
+        entries[name] = nil
+        pending[name] = nil
+        notifyChange()
+        try save()
+    }
+
+    func reindex(_ url: URL) throws { try invalidate(url); indexFile(url) }
+
+    func prune() throws {
+        let names = Set(entries.keys).union(pending.keys)
+        for name in names {
+            let url = directory.appendingPathComponent(name)
+            let revision = fileRevision(url)
+            if revision == nil || (entries[name] != nil && entries[name]?.revision != revision) {
+                try invalidate(url)
+            }
+        }
+    }
+
+    func build() {
+        do { try prune() }
+        catch { report(error); return }
+        for url in capturedFiles(in: directory) { indexFile(url) }
+    }
+
+    private func notifyChange() {
+        guard !changeNotificationPending else { return }
+        changeNotificationPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.changeNotificationPending = false
+            self.onChange?()
+        }
+    }
+
+    private func report(_ error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            if let onError = self?.onError { onError(error) }
+            else { NSLog("SnapShelf OCR cache privacy error: %@", error.localizedDescription) }
+        }
+    }
+
+    private func save() throws {
+        do {
+            let data = try JSONEncoder().encode(Cache(version: 2, entries: entries))
+            try data.write(to: indexURL, options: .atomic)
+        } catch {
+            // This file is rebuildable. A failed rewrite must not leave text from the
+            // previous image on disk after the edited PNG has already been saved.
+            do { try FileManager.default.removeItem(at: indexURL) }
+            catch let purgeError as NSError where purgeError.domain == NSCocoaErrorDomain
+                && purgeError.code == NSFileNoSuchFileError { return }
+            catch {
+                throw NSError(domain: "SnapShelf.OCRPrivacy", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "The previous OCR cache could not be cleared. Check disk space and permissions for \(indexURL.path), then try saving again.",
+                    NSUnderlyingErrorKey: error,
+                ])
+            }
+        }
+    }
+}
 
 // Decode a downsampled copy straight from disk via ImageIO. `maxPixel` bounds the longer
 // side. Used everywhere a preview is drawn so the full-res bitmap (60MB for a 5K shot)
@@ -75,7 +278,7 @@ final class ActionButton: NSButton {
 
 // MARK: - Annotations
 
-enum Tool: Int { case pen = 0, highlight, arrow, box, text, blur, crop }
+enum Tool: Int { case pen = 0, highlight, arrow, box, text, blur, redact, crop }
 
 enum Annotation {
     case pen([NSPoint], NSColor)
@@ -84,6 +287,7 @@ enum Annotation {
     case box(NSRect, NSColor)
     case text(String, NSPoint, NSColor, CGFloat)
     case blur(NSRect, NSImage)   // rect + prebuilt pixelated tile of that region
+    case redact(NSRect)   // opaque pixels, unlike cosmetic pixelation
 
     func draw(lineWidth lw: CGFloat) {
         switch self {
@@ -146,6 +350,9 @@ enum Annotation {
             ctx?.imageInterpolation = .none   // hard pixel blocks, no smoothing
             tile.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1)
             ctx?.imageInterpolation = prev
+        case .redact(let r):
+            NSColor.black.setFill()
+            NSBezierPath(rect: r).fill()
         }
     }
 
@@ -158,6 +365,7 @@ enum Annotation {
         case .box(let r, let c): return .box(NSRect(origin: t(r.origin), size: r.size), c)
         case .text(let s, let p, let c, let f): return .text(s, t(p), c, f)
         case .blur(let r, let tile): return .blur(NSRect(origin: t(r.origin), size: r.size), tile)
+        case .redact(let r): return .redact(NSRect(origin: t(r.origin), size: r.size))
         }
     }
 }
@@ -181,6 +389,7 @@ final class EditorCanvas: NSView {
     var color: NSColor = .systemRed
     var widthScale: CGFloat = 1   // set by the S/M/L picker
     var onTextRequest: ((NSPoint) -> Void)?   // image-point where user clicked with text tool
+    private(set) var editGeneration = 0
 
     // Undo stack: annotations undo one mark, crops restore the pre-crop state.
     private enum EditOp {
@@ -237,8 +446,8 @@ final class EditorCanvas: NSView {
             switch tool {
             case .arrow: Annotation.arrow(s, c, color).draw(lineWidth: lw)
             case .box: Annotation.box(r, color).draw(lineWidth: lw)
-            case .blur:
-                NSColor.black.withAlphaComponent(0.35).setFill()
+            case .blur, .redact:
+                NSColor.black.withAlphaComponent(tool == .redact ? 1 : 0.35).setFill()
                 NSBezierPath(rect: r).fill()
             case .crop:
                 NSColor.controlAccentColor.withAlphaComponent(0.15).setFill()
@@ -293,6 +502,11 @@ final class EditorCanvas: NSView {
                     addMark(.blur(r, tile))
                 }
             }
+        case .redact:
+            if let s = dragStart {
+                let r = rect(from: s, to: p).intersection(NSRect(origin: .zero, size: image.size))
+                if r.width * viewScale > 6, r.height * viewScale > 6 { addMark(.redact(r)) }
+            }
         case .crop:
             if let s = dragStart {
                 let r = rect(from: s, to: p)
@@ -311,6 +525,8 @@ final class EditorCanvas: NSView {
     }
 
     func addMark(_ a: Annotation) {
+        editGeneration += 1
+        searchHighlights = []
         var w = Self.strokeWidth(for: image) * widthScale
         if case .highlight = a { w *= 5 }
         marks.append(Mark(a: a, width: w))
@@ -318,6 +534,8 @@ final class EditorCanvas: NSView {
     }
 
     func undo() {
+        editGeneration += 1
+        searchHighlights = []
         switch ops.popLast() {
         case .mark:
             _ = marks.popLast()
@@ -331,12 +549,16 @@ final class EditorCanvas: NSView {
     }
 
     private func applyCrop(imageRect r: NSRect) {
+        let r = r.intersection(NSRect(origin: .zero, size: image.size)).integral
+        guard !r.isEmpty else { return }
         guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
         let s = CGFloat(cg.width) / max(image.size.width, 1)
         let px = CGRect(x: r.minX * s, y: (image.size.height - r.maxY) * s,
                         width: r.width * s, height: r.height * s).integral
         guard px.width > 2, px.height > 2, let cropped = cg.cropping(to: px) else { return }
         ops.append(.crop(image, marks))
+        editGeneration += 1
+        searchHighlights = []
         image = NSImage(cgImage: cropped, size: NSSize(width: px.width / s, height: px.height / s))
         let d = NSPoint(x: -r.minX, y: -r.minY)
         marks = marks.map { Mark(a: $0.a.translated(by: d), width: $0.width) }
@@ -348,7 +570,10 @@ final class EditorCanvas: NSView {
 
     // Downscale the region to ~12pt blocks; drawn back up with interpolation off = pixelate.
     private func pixelTile(for r: NSRect) -> NSImage? {
-        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        // Sample visible edits as well as the original image. Sampling the original
+        // could bring a secret back when Blur is applied over an existing redaction.
+        guard let data = renderPNG(), let rendered = NSImage(data: data),
+              let cg = rendered.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
         let s = CGFloat(cg.width) / max(image.size.width, 1)
         let px = CGRect(x: r.minX * s, y: (image.size.height - r.maxY) * s,
                         width: r.width * s, height: r.height * s).integral
@@ -382,6 +607,8 @@ final class EditorCanvas: NSView {
         rep.size = image.size
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = ctx
+        ctx.cgContext.scaleBy(x: CGFloat(cg.width) / max(image.size.width, 1),
+                              y: CGFloat(cg.height) / max(image.size.height, 1))
         image.draw(in: NSRect(origin: .zero, size: image.size))
         for m in marks { m.a.draw(lineWidth: m.width) }
         ctx.flushGraphics()
@@ -399,16 +626,18 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     private let widthPicker = NSSegmentedControl(labels: ["S", "M", "L"],
                                                  trackingMode: .selectOne, target: nil, action: nil)
     private let colorWell = NSColorWell()
-    private let onSave: (Data) -> Void
+    private let onSave: (Data) throws -> Void
     private var activeField: NSTextField?
     private var pendingTextPoint = NSPoint.zero
     var onClosed: (() -> Void)?
+    var onSaveError: ((Error) -> Void)?
+    var editGeneration: Int { canvas.editGeneration }
 
-    init(image: NSImage, tool: Tool, onSave: @escaping (Data) -> Void) {
+    init(image: NSImage, tool: Tool, onSave: @escaping (Data) throws -> Void) {
         self.onSave = onSave
         canvas = EditorCanvas(image: image)
         canvas.tool = tool
-        toolPicker = NSSegmentedControl(labels: ["Pen", "Highlight", "Arrow", "Box", "Text", "Blur", "Crop"],
+        toolPicker = NSSegmentedControl(labels: ["Pen", "Highlight", "Arrow", "Box", "Text", "Blur", "Redact", "Crop"],
                                         trackingMode: .selectOne, target: nil, action: nil)
         toolPicker.selectedSegment = tool.rawValue
 
@@ -492,8 +721,17 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
 
     private func saveAndClose() {
         commitActiveField()
-        if let data = canvas.renderPNG() { onSave(data) }
-        window.close()
+        do {
+            guard let data = canvas.renderPNG() else { throw CocoaError(.fileWriteUnknown) }
+            try onSave(data)
+            window.close()
+        } catch {
+            if let onSaveError { onSaveError(error); return }
+            let alert = NSAlert()
+            alert.messageText = "Screenshot could not be saved"
+            alert.informativeText = "Your edits are still open. \(error.localizedDescription)"
+            alert.beginSheetModal(for: window)
+        }
     }
 
     @objc private func toolChanged() {
@@ -659,6 +897,10 @@ final class ShelfItem: NSObject {
     let url: URL
     var onClosed: ((ShelfItem) -> Void)?
     var onSaved: ((URL) -> Void)?   // editor wrote a new version of the file
+    var onEdit: ((URL, Tool) -> Void)?
+    var onLayoutChanged: (() -> Void)?
+    var isEditing = false
+    private let clipboard: CaptureClipboard
 
     // Only the point size is kept; the pixels live on disk and in the downsampled preview.
     private var imageSize: NSSize
@@ -671,13 +913,33 @@ final class ShelfItem: NSObject {
     private let linkBtn = ActionButton(title: "Link")
     private let closeBtn = ActionButton(title: "✕")
     private var watcher: DispatchSourceFileSystemObject?
-    private var editor: EditorController?
     private var closed = false
+    private var visibleFrame: NSRect
 
-    static func thumbSize(for imageSize: NSSize) -> NSSize {
-        let scale = min(1, maxThumbWidth / max(imageSize.width, 1))
+    static func thumbSize(for imageSize: NSSize, maximum: NSSize = NSSize(width: 320, height: 240)) -> NSSize {
+        let scale = min(1, maximum.width / max(imageSize.width, 1), maximum.height / max(imageSize.height, 1))
         return NSSize(width: max(imageSize.width * scale, 60),
                       height: max(imageSize.height * scale, 40))
+    }
+
+    // The newest suffix that fits remains visible; overflow remains in History/Recent.
+    static func frames(for sizes: [NSSize], in visibleFrame: NSRect) -> [NSRect?] {
+        let area = visibleFrame.insetBy(dx: screenMargin, dy: screenMargin)
+        var result = [NSRect?](repeating: nil, count: sizes.count)
+        var used: CGFloat = 0
+        var first = sizes.count
+        for i in sizes.indices.reversed() {
+            let extra = sizes[i].height + (first == sizes.count ? 0 : 8)
+            guard sizes[i].width <= area.width, used + extra <= area.height else { break }
+            used += extra
+            first = i
+        }
+        var y = area.minY
+        for i in first..<sizes.count {
+            result[i] = NSRect(origin: NSPoint(x: area.minX, y: y), size: sizes[i])
+            y += sizes[i].height + 8
+        }
+        return result
     }
 
     // Retina-sharp at thumb size, nothing bigger. Falls back to the full image only if
@@ -688,8 +950,10 @@ final class ShelfItem: NSObject {
         return downsampledImage(at: url, maxPixel: max(size.width, size.height) * scale) ?? fallback
     }
 
-    init(url: URL, image: NSImage, origin: NSPoint) {
+    init(url: URL, image: NSImage, origin: NSPoint, clipboard: CaptureClipboard = CaptureClipboard()) {
         self.url = url
+        self.clipboard = clipboard
+        self.visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         self.imageSize = image.size
         self.thumbView = ThumbView(preview: ShelfItem.preview(for: url, imageSize: image.size, fallback: image),
                                    fileURL: url)
@@ -745,7 +1009,9 @@ final class ShelfItem: NSObject {
     }
 
     private func layout() {
-        let fit = ShelfItem.thumbSize(for: imageSize)
+        let maximum = NSSize(width: min(maxThumbWidth, max(60, visibleFrame.width - 2 * screenMargin)),
+                             height: min(240, max(40, visibleFrame.height - 2 * screenMargin - Self.barHeight)))
+        let fit = ShelfItem.thumbSize(for: imageSize, maximum: maximum)
         let size = NSSize(width: max(fit.width, barMinWidth), height: fit.height)
         var frame = panel.frame
         frame.size = NSSize(width: size.width, height: size.height + Self.barHeight)
@@ -761,22 +1027,23 @@ final class ShelfItem: NSObject {
         }
         closeBtn.frame.origin = NSPoint(x: size.width - closeBtn.frame.width - 6,
                                         y: (Self.barHeight - closeBtn.frame.height) / 2)
+        onLayoutChanged?()
     }
+
+    func fit(to frame: NSRect) { visibleFrame = frame; layout() }
 
     // MARK: Actions
 
     private func copyToClipboard() {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        // Read from disk so editor saves are what gets copied.
-        guard let current = NSImage(contentsOf: url) else { return }
-        pb.writeObjects([current, url as NSURL])
+        clipboard.copy(url)
         copyBtn.title = "Copied ✓"
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.copyBtn.title = "Copy"
             self?.copyBtn.sizeToFit()
+            self?.layout()
         }
         copyBtn.sizeToFit()
+        layout()
     }
 
     // On-device text recognition → clipboard.
@@ -784,6 +1051,8 @@ final class ShelfItem: NSObject {
         ocrBtn.title = "…"
         ocrBtn.sizeToFit()
         let u = url
+        let revision = fileRevision(u)
+        let clipboardCount = clipboard.currentChangeCount
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var text = ""
             if let img = NSImage(contentsOf: u),
@@ -797,14 +1066,20 @@ final class ShelfItem: NSObject {
                     .joined(separator: "\n")
             }
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, !self.closed else { return }
+                guard revision != nil, fileRevision(u) == revision else {
+                    self.ocrBtn.title = "Retry OCR"
+                    self.ocrBtn.sizeToFit()
+                    self.layout()
+                    return
+                }
                 if text.isEmpty {
                     self.ocrBtn.title = "No text"
-                } else {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(text, forType: .string)
+                } else if self.clipboard.currentChangeCount == clipboardCount {
+                    self.clipboard.copyText(text, from: u)
                     self.ocrBtn.title = "Copied ✓"
+                } else {
+                    self.ocrBtn.title = "Retry OCR"
                 }
                 self.ocrBtn.sizeToFit()
                 self.layout()
@@ -818,12 +1093,16 @@ final class ShelfItem: NSObject {
     }
 
     // Upload to litterbox (catbox.moe's temp host, no account needed) and copy the URL.
-    // Anyone with the link can view it, so blur secrets first; expires after 72 hours.
+    // Anyone with the link can view it, so redact secrets first; expires after 72 hours.
     private func shareLink() {
         linkBtn.title = "…"
         linkBtn.sizeToFit()
         layout()
-        guard let fileData = try? Data(contentsOf: url) else { return }
+        guard let fileData = try? Data(contentsOf: url) else {
+            linkBtn.title = "Failed"; linkBtn.sizeToFit(); layout(); return
+        }
+        let revision = fileRevision(url)
+        let clipboardCount = clipboard.currentChangeCount
         var req = URLRequest(url: URL(string: "https://litterbox.catbox.moe/resources/internals/api.php")!)
         req.httpMethod = "POST"
         let boundary = "snapshelf-\(UUID().uuidString)"
@@ -837,14 +1116,14 @@ final class ShelfItem: NSObject {
         body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
         URLSession.shared.uploadTask(with: req, from: body) { [weak self] data, response, _ in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, !self.closed else { return }
                 let link = data.flatMap { String(data: $0, encoding: .utf8) }?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if let link, link.hasPrefix("http"),
+                   revision != nil, fileRevision(self.url) == revision,
+                   self.clipboard.currentChangeCount == clipboardCount,
                    (response as? HTTPURLResponse)?.statusCode == 200 {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(link, forType: .string)
+                    self.clipboard.copyText(link)
                     self.linkBtn.title = "Link ✓"
                 } else {
                     self.linkBtn.title = "Failed"
@@ -861,50 +1140,37 @@ final class ShelfItem: NSObject {
     }
 
     private func openEditor(tool: Tool) {
-        if let editor {
-            editor.show()
-            return
-        }
-        guard let current = NSImage(contentsOf: url) else { return }
-        let e = EditorController(image: current, tool: tool) { [weak self] data in
-            guard let self else { return }
-            try? data.write(to: self.url)   // watcher picks this up → thumb reloads + refits
-            self.onSaved?(self.url)         // re-OCR: blurred text must leave the search index
-        }
-        e.onClosed = { [weak self] in
-            guard let self, !self.closed else { return }
-            self.editor = nil
-            self.panel.orderFrontRegardless()   // bring the thumb back when editing ends
-        }
-        editor = e
-        panel.orderOut(nil)   // big editor replaces the small thumb while open
-        e.show()
+        onEdit?(url, tool)
     }
 
     func close() {
+        guard !closed else { return }
         closed = true
-        editor?.close()
         watcher?.cancel()
         watcher = nil
         panel.orderOut(nil)
         onClosed?(self)
     }
 
+    deinit { watcher?.cancel() }
+
     // MARK: File watcher — editor saves land back on the thumbnail
 
     private func startWatching() {
+        guard !closed, watcher == nil else { return }
         let fd = open(url.path, O_EVTONLY)
         guard fd >= 0 else { return }
         let src = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename], queue: .main)
         src.setEventHandler { [weak self] in
-            guard let self, let w = self.watcher else { return }
+            guard let self, !self.closed, let w = self.watcher else { return }
             let flags = w.data
             // Atomic saves replace the file: re-arm the watch on the new inode.
             if flags.contains(.delete) || flags.contains(.rename) {
                 w.cancel()
                 self.watcher = nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                    guard let self, !self.closed else { return }
                     self.reloadFromDisk()
                     self.startWatching()
                 }
@@ -917,11 +1183,17 @@ final class ShelfItem: NSObject {
         watcher = src
     }
 
-    private func reloadFromDisk() {
-        guard let img = NSImage(contentsOf: url) else { return }
+    func reloadFromDisk() {
+        guard !closed else { return }
+        guard let img = NSImage(contentsOf: url) else {
+            onSaved?(url)
+            if !FileManager.default.fileExists(atPath: url.path) { close() }
+            return
+        }
         imageSize = img.size
         thumbView.preview = ShelfItem.preview(for: url, imageSize: img.size, fallback: img)
         layout()
+        onSaved?(url)
     }
 }
 
@@ -929,12 +1201,14 @@ final class ShelfItem: NSObject {
 
 final class HistoryCell: NSView, NSDraggingSource {
     let url: URL
+    let revision: String?
     var onPin: ((URL) -> Void)?
     private var downPoint = NSPoint.zero
     private var dragging = false
 
     init(url: URL) {
         self.url = url
+        self.revision = fileRevision(url)
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
@@ -981,11 +1255,15 @@ final class HistoryGrid: NSView {
     override var isFlipped: Bool { true }   // newest capture top-left
 
     func show(urls: [URL]) {
-        subviews.forEach { $0.removeFromSuperview() }
-        for u in urls {
+        let existing = Dictionary(uniqueKeysWithValues: subviews.compactMap { view -> (URL, HistoryCell)? in
+            guard let cell = view as? HistoryCell else { return nil }
+            return (cell.url, cell)
+        })
+        subviews = urls.map { u -> NSView in
+            if let cell = existing[u], cell.revision == fileRevision(u) { return cell }
             let c = HistoryCell(url: u)
             c.onPin = { [weak self] in self?.onPin?($0) }
-            addSubview(c)
+            return c
         }
         relayout()
     }
@@ -1017,19 +1295,17 @@ final class HistoryWindow: NSObject {
     private let search = NSSearchField()
     private let grid = HistoryGrid()
     private let scroll = NSScrollView()
-    private var index: [String: String] = [:]   // filename → recognized text
-    private var indexGen: [String: Int] = [:]   // bumped per reindex; stale OCR results are dropped
-    private var indexing = false
-    private let indexURL = saveDir.appendingPathComponent(".ocr-index.json")
+    private let index: CaptureIndex
+    private let directory: URL
+    private var displayedFiles: [String] = []
 
-    override init() {
+    init(directory: URL = saveDir) {
+        self.directory = directory
+        self.index = CaptureIndex(directory: directory)
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 540),
                           styleMask: [.titled, .closable, .resizable],
                           backing: .buffered, defer: false)
         super.init()
-        // Loaded at launch, not on first open: prune()/reindex() run before the window
-        // is ever shown, and saving an empty in-memory index would wipe the file.
-        index = loadIndex()
         window.title = "SnapShelf History"
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 420, height: 300)
@@ -1051,6 +1327,12 @@ final class HistoryWindow: NSObject {
 
         let container = HistoryContainer(search: search, scroll: scroll)
         window.contentView = container
+        index.onChange = { [weak self] in
+            guard let self else { return }
+            self.window.title = self.index.isIndexing ? "SnapShelf History — indexing…" : "SnapShelf History"
+            if self.window.isVisible { self.reload() }
+        }
+        index.onError = { [weak self] error in self?.showIndexError(error) }
     }
 
     func open() {
@@ -1066,13 +1348,16 @@ final class HistoryWindow: NSObject {
 
     private func reload() {
         let q = search.stringValue.lowercased()
-        var urls = capturedFiles()
+        var urls = capturedFiles(in: directory)
         if !q.isEmpty {
             urls = urls.filter {
                 $0.lastPathComponent.lowercased().contains(q)
-                    || (index[$0.lastPathComponent]?.lowercased().contains(q) ?? false)
+                    || (index.text(for: $0)?.lowercased().contains(q) ?? false)
             }
         }
+        let files = urls.map { "\($0.path)|\(fileRevision($0) ?? "missing")" }
+        guard files != displayedFiles else { return }
+        displayedFiles = files
         grid.show(urls: urls)
     }
 
@@ -1083,7 +1368,7 @@ final class HistoryWindow: NSObject {
         let req = VNRecognizeTextRequest()
         req.recognitionLevel = .accurate
         req.usesLanguageCorrection = true
-        try? VNImageRequestHandler(cgImage: cg).perform([req])
+        do { try VNImageRequestHandler(cgImage: cg).perform([req]) } catch { return [] }
         let w = img.size.width, h = img.size.height
         let q = query.lowercased()
         var rects: [NSRect] = []
@@ -1112,7 +1397,7 @@ final class HistoryWindow: NSObject {
         // garbage that no search query can match. Runs once per file.
         req.recognitionLevel = .accurate
         req.usesLanguageCorrection = true
-        try? VNImageRequestHandler(cgImage: cg).perform([req])
+        do { try VNImageRequestHandler(cgImage: cg).perform([req]) } catch { return nil }
         return (req.results ?? [])
             .compactMap { $0.topCandidates(1).first?.string }
             .joined(separator: " ")
@@ -1120,69 +1405,38 @@ final class HistoryWindow: NSObject {
 
     // Called on every new capture so search is current without reopening the window.
     func indexFile(_ url: URL) {
-        let name = url.lastPathComponent
-        guard index[name] == nil else { return }
-        let gen = indexGen[name, default: 0]
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let text = HistoryWindow.recognizeText(in: url) else { return }
-            DispatchQueue.main.async {
-                guard let self, self.indexGen[name, default: 0] == gen else { return }
-                self.index[name] = text
-                self.saveIndex()
-            }
-        }
+        index.indexFile(url)
     }
 
     // The file changed under an existing entry (editor save). Drop the old text NOW so a
     // blurred secret is unsearchable immediately, then OCR the new pixels.
-    func reindex(_ url: URL) {
-        let name = url.lastPathComponent
-        indexGen[name, default: 0] += 1
-        index[name] = nil
-        saveIndex()
-        indexFile(url)
+    func reindex(_ url: URL) throws {
+        try index.reindex(url)
+    }
+
+    func fileChanged(_ url: URL) {
+        do { try reindex(url) }
+        catch { showIndexError(error) }
     }
 
     // Text must not outlive its screenshot (60-day cleanup, manual deletes in Finder).
     func prune() {
-        let live = Set(capturedFiles().map { $0.lastPathComponent })
-        let before = index.count
-        index = index.filter { live.contains($0.key) }
-        if index.count != before { saveIndex() }
+        do { try index.prune() }
+        catch { showIndexError(error) }
     }
 
     // OCR every un-indexed capture in the background so search-by-content works.
     private func buildIndex() {
-        guard !indexing else { return }
-        indexing = true
-        window.title = "SnapShelf History — indexing…"
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            var idx = self.loadIndex()
-            for f in capturedFiles() where idx[f.lastPathComponent] == nil {
-                idx[f.lastPathComponent] = HistoryWindow.recognizeText(in: f) ?? ""
-            }
-            DispatchQueue.main.async {
-                // In-memory wins: a reindex() that landed mid-build is fresher than the
-                // disk snapshot this pass started from.
-                self.index.merge(idx) { current, _ in current }
-                self.prune()
-                self.saveIndex()
-                self.indexing = false
-                self.window.title = "SnapShelf History"
-                self.reload()
-            }
-        }
+        index.build()
     }
 
-    private func saveIndex() {
-        if let data = try? JSONEncoder().encode(index) { try? data.write(to: indexURL) }
-    }
-
-    private func loadIndex() -> [String: String] {
-        guard let data = try? Data(contentsOf: indexURL),
-              let idx = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
-        return idx
+    private func showIndexError(_ error: Error) {
+        // The save path already presents its error on the editor. Avoid stacking a
+        // second alert if a watcher reports the same failed cache purge afterward.
+        guard NSApp.keyWindow?.attachedSheet == nil else { return }
+        let alert = NSAlert(error: error)
+        if let parent = NSApp.keyWindow { alert.beginSheetModal(for: parent) }
+        else { alert.runModal() }
     }
 }
 
@@ -1217,9 +1471,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotKeyRefs: [EventHotKeyRef?] = []
     private var loginItem: NSMenuItem!
     private let recentMenu = NSMenu()
-    private let history = HistoryWindow()
+    private let history: HistoryWindow
+    private let directory: URL
+    private let clipboard: CaptureClipboard
+    private var editors: [URL: EditorController] = [:]
+    private var isReflowing = false
     // Recent Captures icons. Keyed on path + mtime so an editor save invalidates the entry.
     private var menuThumbs: [String: NSImage] = [:]
+
+    init(directory: URL = saveDir, pasteboard: NSPasteboard = .general) {
+        self.directory = directory
+        self.history = HistoryWindow(directory: directory)
+        self.clipboard = CaptureClipboard(pasteboard: pasteboard)
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -1257,53 +1522,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         registerHotkeys()
 
-        // Keep it always available: register as login item on first run.
-        if SMAppService.mainApp.status == .notRegistered { try? SMAppService.mainApp.register() }
+        if LoginPreference.registerOnLaunch(defaults: .standard, status: SMAppService.mainApp.status) {
+            do { try SMAppService.mainApp.register() }
+            catch { NSLog("SnapShelf login registration failed: %@", error.localizedDescription) }
+        }
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
 
         history.onPin = { [weak self] url in self?.showThumb(for: url) }
         history.onPreview = { [weak self] url, query in self?.openSearchPreview(url: url, query: query) }
+        NotificationCenter.default.addObserver(self, selector: #selector(reflowShelf),
+                                               name: NSApplication.didChangeScreenParametersNotification, object: nil)
         cleanupOldCaptures()
     }
 
     @objc private func openHistory() { history.open() }
 
-    private var previewEditors: [EditorController] = []
-
     private func openSearchPreview(url: URL, query: String) {
+        openEditor(url: url, tool: .pen, query: query)
+    }
+
+    private func saveCapture(_ data: Data, to url: URL) throws {
+        try CaptureFiles.save(data, to: url)
+        clipboard.refreshAfterSave(url)
+        try history.reindex(url)
+        for item in items where item.url == url { item.reloadFromDisk() }
+        reflowShelf()
+    }
+
+    private func openEditor(url: URL, tool: Tool, query: String? = nil) {
+        if let existing = editors[url] { existing.show(); return }
         guard let image = NSImage(contentsOf: url) else { return }
-        let e = EditorController(image: image, tool: .pen) { [weak self] data in
-            try? data.write(to: url)
-            self?.history.reindex(url)
+        let e = EditorController(image: image, tool: tool) { [weak self] data in
+            guard let self else { throw CocoaError(.fileWriteUnknown) }
+            try self.saveCapture(data, to: url)
         }
         e.onClosed = { [weak self, weak e] in
-            self?.previewEditors.removeAll { $0 === e }
+            guard let self, self.editors[url] === e else { return }
+            self.editors[url] = nil
+            for item in self.items where item.url == url { item.isEditing = false }
+            self.reflowShelf()
         }
-        previewEditors.append(e)
-        e.window.title = "Finding “\(query)”…"
+        editors[url] = e
+        for item in items where item.url == url { item.isEditing = true }
+        reflowShelf()
         e.show()
-        DispatchQueue.global(qos: .userInitiated).async {
+        guard let query else { return }
+        e.window.title = "Finding “\(query)”…"
+        let revision = fileRevision(url)
+        let generation = e.editGeneration
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, weak e] in
             let rects = HistoryWindow.matchRects(in: url, query: query)
-            DispatchQueue.main.async { e.showSearchHighlights(rects, query: query) }
+            DispatchQueue.main.async {
+                guard let self, let e, self.editors[url] === e,
+                      e.editGeneration == generation, fileRevision(url) == revision else { return }
+                e.showSearchHighlights(rects, query: query)
+            }
         }
     }
 
     private func cleanupOldCaptures() {
-        DispatchQueue.global(qos: .utility).async {
+        let directory = self.directory
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             let cutoff = Date().addingTimeInterval(-Double(autoCleanupDays) * 86400)
-            for f in capturedFiles() {
+            let old = capturedFiles(in: directory).filter { f in
                 let d = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                if let d, d < cutoff { try? FileManager.default.removeItem(at: f) }
+                return d.map { $0 < cutoff } ?? false
             }
-            DispatchQueue.main.async { [weak self] in self?.history.prune() }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                for f in old where self.editors[f] == nil {
+                    let date = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                    if let date, date < cutoff { try? FileManager.default.removeItem(at: f) }
+                }
+                self.history.prune()
+            }
         }
     }
 
     @objc private func toggleLogin() {
-        if SMAppService.mainApp.status == .enabled {
-            try? SMAppService.mainApp.unregister()
-        } else {
-            try? SMAppService.mainApp.register()
+        let enabled = SMAppService.mainApp.status == .enabled || SMAppService.mainApp.status == .requiresApproval
+        // Record intent first, including if the OS rejects the requested operation.
+        UserDefaults.standard.set(!enabled, forKey: LoginPreference.key)
+        do {
+            if enabled { try SMAppService.mainApp.unregister() }
+            else { try SMAppService.mainApp.register() }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Start at Login could not be changed"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
         }
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
@@ -1354,55 +1661,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func captureFull() { runCapture(interactive: false) }
 
     private func runCapture(interactive: Bool) {
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let name = "Screenshot \(df.string(from: Date())).png"
-        let url = saveDir.appendingPathComponent(name)
+        let url = CaptureFiles.destination(in: directory)
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
         p.arguments = (interactive ? ["-i"] : ["-m"]) + [url.path]
-        p.terminationHandler = { [weak self] _ in
+        p.terminationHandler = { [weak self] process in
             DispatchQueue.main.async {
-                // Esc during area select → no file → nothing to show.
-                guard FileManager.default.fileExists(atPath: url.path) else { return }
+                guard CaptureFiles.succeeded(at: url, status: process.terminationStatus,
+                                             reason: process.terminationReason) else {
+                    try? FileManager.default.removeItem(at: url)
+                    return
+                }
                 self?.showThumb(for: url)
             }
         }
-        try? p.run()
+        do { try p.run() }
+        catch { NSLog("SnapShelf capture could not start: %@", error.localizedDescription) }
     }
 
     // MARK: - Thumbnail shelf
 
     private func showThumb(for url: URL) {
-        guard let image = NSImage(contentsOf: url), let screen = NSScreen.main else { return }
-
-        // ponytail: new thumbs stack upward from bottom-left; gaps after dismissals
-        // aren't repacked — restack logic when it bothers you.
-        let stackedHeight = items.reduce(CGFloat(0)) { $0 + $1.panel.frame.height + 8 }
-        let origin = NSPoint(x: screen.visibleFrame.minX + screenMargin,
-                             y: screen.visibleFrame.minY + screenMargin + stackedHeight)
-
-        let item = ShelfItem(url: url, image: image, origin: origin)
+        if let existing = items.first(where: { $0.url == url }) {
+            items.removeAll { $0 === existing }
+            items.append(existing)
+            reflowShelf()
+            return
+        }
+        guard let image = NSImage(contentsOf: url), NSScreen.main != nil else { return }
+        let item = ShelfItem(url: url, image: image, origin: .zero, clipboard: clipboard)
         item.onClosed = { [weak self] it in
             self?.items.removeAll { $0 === it }
+            self?.reflowShelf()
         }
-        item.onSaved = { [weak self] in self?.history.reindex($0) }
-        item.panel.orderFrontRegardless()
+        item.onSaved = { [weak self] in self?.history.fileChanged($0) }
+        item.onEdit = { [weak self] url, tool in self?.openEditor(url: url, tool: tool) }
+        item.onLayoutChanged = { [weak self] in self?.reflowShelf() }
+        item.isEditing = editors[url] != nil
         items.append(item)
+        reflowShelf()
 
         // Auto-copy: capture is on the clipboard immediately, no button needed.
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.writeObjects([image, url as NSURL])
+        clipboard.copy(url)
 
         history.indexFile(url)   // searchable right away, no window reopen needed
         loadMenuThumb(for: url, into: nil)   // warm the Recent Captures icon off the main thread
     }
 
+    @objc private func reflowShelf() {
+        guard !isReflowing, let screen = NSScreen.main else { return }
+        isReflowing = true
+        defer { isReflowing = false }
+        for item in items { item.fit(to: screen.visibleFrame) }
+        let visible = items.filter { !$0.isEditing }
+        let frames = ShelfItem.frames(for: visible.map { $0.panel.frame.size }, in: screen.visibleFrame)
+        for item in items where item.isEditing { item.panel.orderOut(nil) }
+        for (item, frame) in zip(visible, frames) {
+            if let frame {
+                item.panel.setFrame(frame, display: true)
+                item.panel.orderFrontRegardless()
+            } else { item.panel.orderOut(nil) }
+        }
+    }
+
     private func menuThumbKey(_ f: URL) -> String {
-        let m = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-        return "\(f.path)|\(m?.timeIntervalSince1970 ?? 0)"
+        "\(f.path)|\(fileRevision(f) ?? "missing")"
     }
 
     // ImageIO thumbnail on a background queue, cached; the menu item (if any) is filled in
@@ -1415,7 +1739,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let h: CGFloat = 32
             img.size = NSSize(width: max(h * img.size.width / max(img.size.height, 1), 8), height: h)
             DispatchQueue.main.async {
-                self?.menuThumbs[key] = img
+                guard let self, self.menuThumbKey(f) == key else { return }
+                self.menuThumbs[key] = img
                 item?.image = img
             }
         }
@@ -1426,7 +1751,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === recentMenu else { return }
         menu.removeAllItems()
-        let files = capturedFiles().prefix(10)
+        let files = capturedFiles(in: directory).prefix(10)
         if files.isEmpty {
             menu.addItem(NSMenuItem(title: "No captures yet", action: nil, keyEquivalent: ""))
         }
@@ -1448,18 +1773,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func rePin(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
-        if let existing = items.first(where: { $0.url == url }) {
-            existing.panel.orderFrontRegardless()
-            return
-        }
         showThumb(for: url)
     }
 
-    @objc private func openFolder() { NSWorkspace.shared.open(saveDir) }
+    @objc private func openFolder() { NSWorkspace.shared.open(directory) }
 
     @objc private func dismissAll() {
-        for item in items { item.panel.orderOut(nil) }
-        items.removeAll()
+        for item in items { item.close() }
     }
 }
 
