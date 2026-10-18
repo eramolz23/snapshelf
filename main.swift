@@ -997,7 +997,9 @@ final class ShelfItem: NSObject {
     var onSaved: ((URL) -> Void)?   // editor wrote a new version of the file
     var onEdit: ((URL, Tool) -> Void)?
     var onLayoutChanged: (() -> Void)?
-    var isEditing = false
+    // Hidden while its editor is open — no mouseExited arrives, so drop the hover state here
+    // or the controls would still be up when the thumbnail returns.
+    var isEditing = false { didSet { if isEditing { setHover(false) } } }
     private let clipboard: CaptureClipboard
 
     // Only the point size is kept; the pixels live on disk and in the downsampled preview.
