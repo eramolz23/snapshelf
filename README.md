@@ -10,8 +10,9 @@ Single Swift file, no dependencies, no Apple Developer account needed.
 
 - **Capture**: `⌃⌘2` area (press **Space** during selection for window capture),
   `⌃⌘1` full screen, or use the menu bar icon
-- **Pinned thumbnails** (max 220×165, icon toolbar — hover for names) stack bottom-left,
-  reflow after changes, and fit on screen.
+- **Pinned thumbnails** (max 220×165) stack bottom-left; the copy / OCR / crop / markup /
+  link / ✕ controls appear over the top of the picture when you hover it (hover an icon for
+  its name). They reflow after changes and fit on screen.
   If the shelf fills up, older thumbnails remain available in Recent Captures and History.
 - **Auto-copy** — every capture is on the clipboard immediately. Saving edits refreshes
   its clipboard image while that capture still owns the clipboard.

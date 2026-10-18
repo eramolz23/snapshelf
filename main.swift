@@ -1,6 +1,6 @@
 // SnapShelf — minimal screenshot shelf for macOS.
 // Hotkeys: ⌃⌘2 area capture, ⌃⌘1 full screen. Also via menu bar icon.
-// Thumbnail floats bottom-left with an icon toolbar (copy, OCR, crop, markup, link, ✕); ✕ dismisses.
+// Thumbnail floats bottom-left; hover it and a dark fade reveals icon controls (copy, OCR, crop, markup, link, ✕); ✕ dismisses.
 // Drag the image into any window to drop the PNG. Clicking the image, Markup, or Crop
 // opens a big centered in-app editor: pen, arrow, box, text, color, undo, crop.
 // ponytail: capture delegates to /usr/sbin/screencapture — Apple's selection UI for free.
@@ -263,6 +263,11 @@ private let hotkeys: [(keyCode: Int, modifiers: Int, id: UInt32)] = [
 
 final class ActionButton: NSButton {
     var onClick: (() -> Void)?
+    var onChange: (() -> Void)?   // setSymbol swapped the icon (transient feedback started or ended)
+    private(set) var symbol = ""
+    private var idleSymbol = ""
+    private var highlights = false   // icon buttons only: light pill under the pointer
+    private var hoverArea: NSTrackingArea?
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     convenience init(title: String) {
         self.init(title: title, target: nil, action: nil)
@@ -274,18 +279,47 @@ final class ActionButton: NSButton {
         font = .systemFont(ofSize: 11)
         sizeToFit()
     }
-    // Icon-only. Width is fixed here, so setSymbol state swaps never resize the button.
+    // Icon-only, white on the thumbnail's dark fade. The size is fixed here, so setSymbol
+    // state swaps never resize the button.
     convenience init(symbol: String, label: String) {
         self.init(title: "")
         imagePosition = .imageOnly
+        isBordered = false
+        showsBorderOnlyWhileMouseInside = false
+        contentTintColor = .white
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        highlights = true
+        idleSymbol = symbol
         setSymbol(symbol, label: label)
-        sizeToFit()
+        setFrameSize(NSSize(width: 26, height: 22))
     }
+    // Showing anything but the idle icon (✓, …, ✗) is feedback the user must be able to see;
+    // the Retry icon is a standing state, not feedback.
+    var isBusy: Bool { symbol != idleSymbol && symbol != "arrow.clockwise" }
     func setSymbol(_ symbol: String, label: String) {
+        self.symbol = symbol
         image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)?
             .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
         toolTip = label
         setAccessibilityLabel(label)
+        onChange?()
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        guard highlights else { return }
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        hoverArea = area
+    }
+    override func mouseEntered(with event: NSEvent) {
+        guard highlights else { return super.mouseEntered(with: event) }
+        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
+    }
+    override func mouseExited(with event: NSEvent) {
+        guard highlights else { return super.mouseExited(with: event) }
+        layer?.backgroundColor = nil
     }
     @objc private func clicked() { onClick?() }
 }
@@ -902,11 +936,61 @@ final class ThumbView: NSView, NSDraggingSource {
                          sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
 }
 
-// MARK: - One pinned screenshot: panel + toolbar + image + file watcher
+// MARK: - Hover controls: dark fade over the top of the thumbnail, icons on it
+
+// Card root: reports the pointer entering/leaving it. .activeAlways because the app is never active.
+final class HoverContainer: NSView {
+    var onHover: ((Bool) -> Void)?
+    private var area: NSTrackingArea?
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area { removeTrackingArea(area) }
+        let a = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(a)
+        area = a
+    }
+    override func mouseEntered(with event: NSEvent) { onHover?(true) }
+    override func mouseExited(with event: NSEvent) { onHover?(false) }
+}
+
+final class HoverBar: NSView {
+    static let fadeHeight: CGFloat = 58   // gradient band at the top of the card
+    static let rowHeight: CGFloat = 30    // the icon row sits in the top of the band
+    static var fadeDuration: TimeInterval = 0.15
+    private(set) var shown = false
+
+    init() {
+        super.init(frame: .zero)
+        alphaValue = 0
+    }
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    func setShown(_ on: Bool) {
+        shown = on
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = Self.fadeDuration
+            animator().alphaValue = on ? 1 : 0
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let black = NSColor.black
+        NSGradient(colorsAndLocations: (black.withAlphaComponent(0.82), 0), (black.withAlphaComponent(0.55), 0.5),
+                   (black.withAlphaComponent(0), 1))?.draw(in: bounds, angle: -90)
+    }
+
+    // Only the buttons take clicks, and only while shown: everything else in the fade falls
+    // through to the image (click → editor, drag → file), and an invisible button never fires.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard shown else { return nil }
+        let local = convert(point, from: superview)
+        return subviews.lazy.compactMap { $0.hitTest(local) }.first
+    }
+}
+
+// MARK: - One pinned screenshot: panel + image + hover controls + file watcher
 
 final class ShelfItem: NSObject {
-    static let barHeight: CGFloat = 26
-
     let panel: NSPanel
     let url: URL
     var onClosed: ((ShelfItem) -> Void)?
@@ -919,7 +1003,8 @@ final class ShelfItem: NSObject {
     // Only the point size is kept; the pixels live on disk and in the downsampled preview.
     private var imageSize: NSSize
     private let thumbView: ThumbView
-    private let bar = NSVisualEffectView()
+    private let bar = HoverBar()
+    private var hovering = false
     private let copyBtn = ActionButton(symbol: "doc.on.doc", label: "Copy")
     private let ocrBtn = ActionButton(symbol: "text.viewfinder", label: "Copy Text (OCR)")
     private let cropBtn = ActionButton(symbol: "crop", label: "Crop")
@@ -973,8 +1058,7 @@ final class ShelfItem: NSObject {
                                    fileURL: url)
 
         let size = ShelfItem.thumbSize(for: image.size)
-        let total = NSSize(width: size.width, height: size.height + ShelfItem.barHeight)
-        panel = NSPanel(contentRect: NSRect(origin: origin, size: total),
+        panel = NSPanel(contentRect: NSRect(origin: origin, size: size),
                         styleMask: [.borderless, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         super.init()
@@ -987,16 +1071,13 @@ final class ShelfItem: NSObject {
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        let container = NSView(frame: NSRect(origin: .zero, size: total))
+        let container = HoverContainer(frame: NSRect(origin: .zero, size: size))
         container.wantsLayer = true
-        container.layer?.cornerRadius = 10
+        container.layer?.cornerRadius = 12
         container.layer?.masksToBounds = true
-        container.layer?.borderWidth = 1
-        container.layer?.borderColor = NSColor.separatorColor.cgColor
-
-        bar.material = .titlebar
-        bar.blendingMode = .behindWindow
-        bar.state = .active
+        container.layer?.borderWidth = 0.5
+        container.layer?.borderColor = NSColor.white.withAlphaComponent(0.5).cgColor
+        container.onHover = { [weak self] in self?.setHover($0) }
 
         thumbView.onClick = { [weak self] in self?.openEditor(tool: .pen) }
         copyBtn.onClick = { [weak self] in self?.copyToClipboard() }
@@ -1007,7 +1088,10 @@ final class ShelfItem: NSObject {
         closeBtn.onClick = { [weak self] in self?.close() }
 
         container.addSubview(thumbView)
-        [copyBtn, ocrBtn, cropBtn, markupBtn, linkBtn, closeBtn].forEach { bar.addSubview($0) }
+        buttons.forEach {
+            $0.onChange = { [weak self] in self?.updateBar() }
+            bar.addSubview($0)
+        }
         container.addSubview(bar)
         panel.contentView = container
 
@@ -1015,7 +1099,21 @@ final class ShelfItem: NSObject {
         startWatching()
     }
 
-    // The toolbar's natural width. The panel never goes narrower, so a narrow capture
+    private var buttons: [ActionButton] { [copyBtn, ocrBtn, cropBtn, markupBtn, linkBtn, closeBtn] }
+
+    // The controls fade in while the pointer is over the card and out when it leaves, but stay
+    // up while any button shows feedback (✓, …, ✗) so the result is never missed.
+    private func setHover(_ on: Bool) {
+        hovering = on
+        updateBar()
+    }
+
+    private func updateBar() {
+        let show = hovering || buttons.contains(where: \.isBusy)
+        if show != bar.shown { bar.setShown(show) }
+    }
+
+    // The icon row's natural width. The panel never goes narrower, so a narrow capture
     // can't push the link/✕ icons off the edge (✕ used to land on top of Crop).
     private var barMinWidth: CGFloat {
         let left = [copyBtn, ocrBtn, cropBtn, markupBtn, linkBtn].reduce(CGFloat(6)) { $0 + $1.frame.width + 4 }
@@ -1024,23 +1122,26 @@ final class ShelfItem: NSObject {
 
     private func layout() {
         let maximum = NSSize(width: min(maxThumbWidth, max(60, visibleFrame.width - 2 * screenMargin)),
-                             height: min(maxThumbHeight, max(40, visibleFrame.height - 2 * screenMargin - Self.barHeight)))
+                             height: min(maxThumbHeight, max(40, visibleFrame.height - 2 * screenMargin)))
         let fit = ShelfItem.thumbSize(for: imageSize, maximum: maximum)
         let size = NSSize(width: max(fit.width, barMinWidth), height: fit.height)
         var frame = panel.frame
-        frame.size = NSSize(width: size.width, height: size.height + Self.barHeight)
+        frame.size = size
         panel.setFrame(frame, display: true)   // origin fixed → stays anchored bottom-left
 
-        thumbView.frame = NSRect(x: 0, y: 0, width: size.width, height: size.height)
-        bar.frame = NSRect(x: 0, y: size.height, width: size.width, height: Self.barHeight)
+        let card = panel.frame.size   // AppKit may round the frame up to whole points
+        thumbView.frame = NSRect(origin: .zero, size: card)
+        let fade = min(HoverBar.fadeHeight, card.height)
+        bar.frame = NSRect(x: 0, y: card.height - fade, width: card.width, height: fade)
 
+        let rowY = fade - HoverBar.rowHeight
         var x: CGFloat = 6
         for btn in [copyBtn, ocrBtn, cropBtn, markupBtn, linkBtn] {
-            btn.frame.origin = NSPoint(x: x, y: (Self.barHeight - btn.frame.height) / 2)
+            btn.frame.origin = NSPoint(x: x, y: rowY + (HoverBar.rowHeight - btn.frame.height) / 2)
             x += btn.frame.width + 4
         }
-        closeBtn.frame.origin = NSPoint(x: size.width - closeBtn.frame.width - 6,
-                                        y: (Self.barHeight - closeBtn.frame.height) / 2)
+        closeBtn.frame.origin = NSPoint(x: card.width - closeBtn.frame.width - 6,
+                                        y: rowY + (HoverBar.rowHeight - closeBtn.frame.height) / 2)
         onLayoutChanged?()
     }
 

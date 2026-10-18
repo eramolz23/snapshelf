@@ -24,7 +24,12 @@ extension ShelfItem {
     var testClosed: Bool { closed }
     var testImageSize: NSSize { imageSize }
     var testBarMinWidth: CGFloat { barMinWidth }
-    var testToolbarImages: [NSImage?] { [copyBtn, ocrBtn, cropBtn, markupBtn, linkBtn, closeBtn].map(\.image) }
+    var testToolbarImages: [NSImage?] { buttons.map(\.image) }
+    var testButtons: [ActionButton] { buttons }
+    var testBar: HoverBar { bar }
+    func testHover(_ on: Bool) { setHover(on) }
+    func testHit(_ point: NSPoint) -> NSView? { panel.contentView?.hitTest(point) }
+    var testThumb: NSView { thumbView }
 }
 
 extension AppDelegate {
@@ -148,11 +153,54 @@ try narrowData.write(to: narrowURL)
 let wideItem = ShelfItem(url: wideURL, image: NSImage(data: wideData)!, origin: .zero, clipboard: clipboard)
 let narrowItem = ShelfItem(url: narrowURL, image: NSImage(data: narrowData)!, origin: .zero, clipboard: clipboard)
 check(wideItem.testToolbarImages.allSatisfy { $0 != nil }, "every toolbar button shows a symbol")
-check(wideItem.testBarMinWidth <= 220, "icon toolbar fits within the maximum thumbnail width")
+check(wideItem.testBarMinWidth <= 220, "icon row fits within the maximum thumbnail width")
 check(wideItem.panel.frame.width <= 220, "wide screenshot panel stays within 220pt")
-check(wideItem.panel.frame.height - ShelfItem.barHeight <= 165, "wide screenshot thumbnail stays within 165pt tall")
-check(narrowItem.panel.frame.height - ShelfItem.barHeight <= 165, "tall screenshot thumbnail stays within 165pt tall")
-check(narrowItem.panel.frame.width >= max(170, narrowItem.testBarMinWidth), "narrow screenshot panel still fits the whole toolbar")
+check(wideItem.panel.frame.height <= 165, "wide screenshot card (no bar strip) stays within 165pt tall")
+check(narrowItem.panel.frame.height <= 165, "tall screenshot card (no bar strip) stays within 165pt tall")
+check(narrowItem.panel.frame.width >= max(170, narrowItem.testBarMinWidth), "narrow screenshot panel still fits the whole icon row")
+
+// Hover controls: hidden when idle, fade in over the top of the card, buttons only take clicks.
+HoverBar.fadeDuration = 0
+let bar = wideItem.testBar, buttons = wideItem.testButtons, card = wideItem.panel.frame.size
+check(bar.alphaValue == 0 && !bar.shown, "controls start hidden")
+check(bar.frame.maxY == card.height && bar.frame.width == card.width && bar.frame.height == 58,
+      "fade covers the top 58pt of the card at full width")
+check(buttons.allSatisfy { bar.frame.contains(bar.convert($0.frame, to: wideItem.panel.contentView).insetBy(dx: 0.5, dy: 0.5)) }
+      && buttons.last!.frame.maxX <= card.width, "all six icons sit inside the fade, ✕ at the right end")
+let gradientGap = NSPoint(x: 6 + 26 + 2, y: card.height - 15)             // between Copy and OCR
+let gradientLow = NSPoint(x: card.width / 2, y: card.height - 50)         // below the icon row
+func center(_ b: NSView) -> NSPoint { wideItem.panel.contentView!.convert(NSPoint(x: b.bounds.midX, y: b.bounds.midY), from: b) }
+check(wideItem.testHit(center(buttons[0])) === wideItem.testThumb, "hidden controls never take clicks: the image does")
+wideItem.testHover(true)
+check(bar.shown && bar.alphaValue == 1, "mouse over the card shows the controls")
+let fadeRep = bar.bitmapImageRepForCachingDisplay(in: bar.bounds)!
+bar.cacheDisplay(in: bar.bounds, to: fadeRep)
+func fadeAlpha(_ y: Int) -> CGFloat { fadeRep.colorAt(x: fadeRep.pixelsWide / 2, y: y)!.alphaComponent }   // y 0 = top
+check(fadeAlpha(0) > 0.78 && abs(fadeAlpha(fadeRep.pixelsHigh / 2) - 0.55) < 0.05 && fadeAlpha(fadeRep.pixelsHigh - 1) < 0.05,
+      "fade is dark at the top of the card and transparent at the bottom of its band")
+check(wideItem.testHit(gradientGap) === wideItem.testThumb, "click in the fade between icons reaches the image")
+check(wideItem.testHit(gradientLow) === wideItem.testThumb, "click low in the fade reaches the image")
+check(buttons.indices.allSatisfy { wideItem.testHit(center(buttons[$0])) === buttons[$0] }, "icon centers hit their buttons")
+wideItem.testHover(false)
+check(!bar.shown && bar.alphaValue == 0, "mouse leaving hides the controls")
+// Feedback keeps the controls up after the mouse leaves; Retry is a standing state, not feedback.
+wideItem.testHover(true)
+buttons[0].setSymbol("checkmark", label: "Copied")
+wideItem.testHover(false)
+check(bar.shown, "copy feedback keeps the controls visible after the mouse leaves")
+buttons[4].setSymbol("ellipsis", label: "Working…")
+buttons[0].setSymbol("doc.on.doc", label: "Copy")
+check(bar.shown, "controls stay while another button still shows feedback")
+buttons[4].setSymbol("link", label: "Share Link (72h)")
+check(!bar.shown && bar.alphaValue == 0, "controls hide once all feedback has reset and the mouse is outside")
+buttons[1].setSymbol("arrow.clockwise", label: "Retry OCR")
+check(!bar.shown, "the standing Retry OCR icon does not pin the controls")
+buttons[1].setSymbol("text.viewfinder", label: "Copy Text (OCR)")
+wideItem.testHover(true)
+buttons[0].setSymbol("checkmark", label: "Copied")
+buttons[0].setSymbol("doc.on.doc", label: "Copy")
+check(bar.shown, "feedback ending while the mouse is over the card leaves the controls up")
+wideItem.testHover(false)
 wideItem.close()
 narrowItem.close()
 clipboard.copy(url)
