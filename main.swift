@@ -1,6 +1,6 @@
 // SnapShelf — minimal screenshot shelf for macOS.
 // Hotkeys: ⌃⌘2 area capture, ⌃⌘1 full screen. Also via menu bar icon.
-// Thumbnail floats bottom-left with a toolbar (Copy / Crop / Markup / ✕); ✕ dismisses.
+// Thumbnail floats bottom-left with an icon toolbar (copy, OCR, crop, markup, link, ✕); ✕ dismisses.
 // Drag the image into any window to drop the PNG. Clicking the image, Markup, or Crop
 // opens a big centered in-app editor: pen, arrow, box, text, color, undo, crop.
 // ponytail: capture delegates to /usr/sbin/screencapture — Apple's selection UI for free.
@@ -11,7 +11,8 @@ import ImageIO
 import ServiceManagement
 import Vision
 
-private let maxThumbWidth: CGFloat = 320
+private let maxThumbWidth: CGFloat = 220
+private let maxThumbHeight: CGFloat = 165
 private let screenMargin: CGFloat = 16
 private let autoCleanupDays = 60   // captures older than this are deleted at launch
 
@@ -272,6 +273,19 @@ final class ActionButton: NSButton {
         controlSize = .small
         font = .systemFont(ofSize: 11)
         sizeToFit()
+    }
+    // Icon-only. Width is fixed here, so setSymbol state swaps never resize the button.
+    convenience init(symbol: String, label: String) {
+        self.init(title: "")
+        imagePosition = .imageOnly
+        setSymbol(symbol, label: label)
+        sizeToFit()
+    }
+    func setSymbol(_ symbol: String, label: String) {
+        image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+        toolTip = label
+        setAccessibilityLabel(label)
     }
     @objc private func clicked() { onClick?() }
 }
@@ -906,17 +920,17 @@ final class ShelfItem: NSObject {
     private var imageSize: NSSize
     private let thumbView: ThumbView
     private let bar = NSVisualEffectView()
-    private let copyBtn = ActionButton(title: "Copy")
-    private let ocrBtn = ActionButton(title: "OCR")
-    private let cropBtn = ActionButton(title: "Crop")
-    private let markupBtn = ActionButton(title: "Markup")
-    private let linkBtn = ActionButton(title: "Link")
-    private let closeBtn = ActionButton(title: "✕")
+    private let copyBtn = ActionButton(symbol: "doc.on.doc", label: "Copy")
+    private let ocrBtn = ActionButton(symbol: "text.viewfinder", label: "Copy Text (OCR)")
+    private let cropBtn = ActionButton(symbol: "crop", label: "Crop")
+    private let markupBtn = ActionButton(symbol: "pencil.tip.crop.circle", label: "Markup")
+    private let linkBtn = ActionButton(symbol: "link", label: "Share Link (72h)")
+    private let closeBtn = ActionButton(symbol: "xmark", label: "Close")
     private var watcher: DispatchSourceFileSystemObject?
     private var closed = false
     private var visibleFrame: NSRect
 
-    static func thumbSize(for imageSize: NSSize, maximum: NSSize = NSSize(width: 320, height: 240)) -> NSSize {
+    static func thumbSize(for imageSize: NSSize, maximum: NSSize = NSSize(width: maxThumbWidth, height: maxThumbHeight)) -> NSSize {
         let scale = min(1, maximum.width / max(imageSize.width, 1), maximum.height / max(imageSize.height, 1))
         return NSSize(width: max(imageSize.width * scale, 60),
                       height: max(imageSize.height * scale, 40))
@@ -1002,7 +1016,7 @@ final class ShelfItem: NSObject {
     }
 
     // The toolbar's natural width. The panel never goes narrower, so a narrow capture
-    // can't push Link/✕ off the edge (✕ used to land on top of Crop).
+    // can't push the link/✕ icons off the edge (✕ used to land on top of Crop).
     private var barMinWidth: CGFloat {
         let left = [copyBtn, ocrBtn, cropBtn, markupBtn, linkBtn].reduce(CGFloat(6)) { $0 + $1.frame.width + 4 }
         return left + 4 + closeBtn.frame.width + 6
@@ -1010,7 +1024,7 @@ final class ShelfItem: NSObject {
 
     private func layout() {
         let maximum = NSSize(width: min(maxThumbWidth, max(60, visibleFrame.width - 2 * screenMargin)),
-                             height: min(240, max(40, visibleFrame.height - 2 * screenMargin - Self.barHeight)))
+                             height: min(maxThumbHeight, max(40, visibleFrame.height - 2 * screenMargin - Self.barHeight)))
         let fit = ShelfItem.thumbSize(for: imageSize, maximum: maximum)
         let size = NSSize(width: max(fit.width, barMinWidth), height: fit.height)
         var frame = panel.frame
@@ -1036,20 +1050,15 @@ final class ShelfItem: NSObject {
 
     private func copyToClipboard() {
         clipboard.copy(url)
-        copyBtn.title = "Copied ✓"
+        copyBtn.setSymbol("checkmark", label: "Copied")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            self?.copyBtn.title = "Copy"
-            self?.copyBtn.sizeToFit()
-            self?.layout()
+            self?.copyBtn.setSymbol("doc.on.doc", label: "Copy")
         }
-        copyBtn.sizeToFit()
-        layout()
     }
 
     // On-device text recognition → clipboard.
     private func runOCR() {
-        ocrBtn.title = "…"
-        ocrBtn.sizeToFit()
+        ocrBtn.setSymbol("ellipsis", label: "Working…")
         let u = url
         let revision = fileRevision(u)
         let clipboardCount = clipboard.currentChangeCount
@@ -1068,25 +1077,19 @@ final class ShelfItem: NSObject {
             DispatchQueue.main.async {
                 guard let self, !self.closed else { return }
                 guard revision != nil, fileRevision(u) == revision else {
-                    self.ocrBtn.title = "Retry OCR"
-                    self.ocrBtn.sizeToFit()
-                    self.layout()
+                    self.ocrBtn.setSymbol("arrow.clockwise", label: "Retry OCR")
                     return
                 }
                 if text.isEmpty {
-                    self.ocrBtn.title = "No text"
+                    self.ocrBtn.setSymbol("text.badge.xmark", label: "No text found")
                 } else if self.clipboard.currentChangeCount == clipboardCount {
                     self.clipboard.copyText(text, from: u)
-                    self.ocrBtn.title = "Copied ✓"
+                    self.ocrBtn.setSymbol("checkmark", label: "Copied")
                 } else {
-                    self.ocrBtn.title = "Retry OCR"
+                    self.ocrBtn.setSymbol("arrow.clockwise", label: "Retry OCR")
                 }
-                self.ocrBtn.sizeToFit()
-                self.layout()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                    self.ocrBtn.title = "OCR"
-                    self.ocrBtn.sizeToFit()
-                    self.layout()
+                    self.ocrBtn.setSymbol("text.viewfinder", label: "Copy Text (OCR)")
                 }
             }
         }
@@ -1095,11 +1098,13 @@ final class ShelfItem: NSObject {
     // Upload to litterbox (catbox.moe's temp host, no account needed) and copy the URL.
     // Anyone with the link can view it, so redact secrets first; expires after 72 hours.
     private func shareLink() {
-        linkBtn.title = "…"
-        linkBtn.sizeToFit()
-        layout()
+        linkBtn.setSymbol("ellipsis", label: "Working…")
         guard let fileData = try? Data(contentsOf: url) else {
-            linkBtn.title = "Failed"; linkBtn.sizeToFit(); layout(); return
+            linkBtn.setSymbol("exclamationmark.triangle", label: "Upload failed")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.linkBtn.setSymbol("link", label: "Share Link (72h)")
+            }
+            return
         }
         let revision = fileRevision(url)
         let clipboardCount = clipboard.currentChangeCount
@@ -1124,16 +1129,12 @@ final class ShelfItem: NSObject {
                    self.clipboard.currentChangeCount == clipboardCount,
                    (response as? HTTPURLResponse)?.statusCode == 200 {
                     self.clipboard.copyText(link)
-                    self.linkBtn.title = "Link ✓"
+                    self.linkBtn.setSymbol("checkmark", label: "Link copied")
                 } else {
-                    self.linkBtn.title = "Failed"
+                    self.linkBtn.setSymbol("exclamationmark.triangle", label: "Upload failed")
                 }
-                self.linkBtn.sizeToFit()
-                self.layout()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    self.linkBtn.title = "Link"
-                    self.linkBtn.sizeToFit()
-                    self.layout()
+                    self.linkBtn.setSymbol("link", label: "Share Link (72h)")
                 }
             }
         }.resume()

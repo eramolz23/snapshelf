@@ -23,6 +23,8 @@ extension ShelfItem {
     var testWatching: Bool { watcher != nil }
     var testClosed: Bool { closed }
     var testImageSize: NSSize { imageSize }
+    var testBarMinWidth: CGFloat { barMinWidth }
+    var testToolbarImages: [NSImage?] { [copyBtn, ocrBtn, cropBtn, markupBtn, linkBtn, closeBtn].map(\.image) }
 }
 
 extension AppDelegate {
@@ -110,8 +112,8 @@ check(renderErrorShown, "failed rendering reports the save error")
 invalidEditor.close()
 
 let tall = ShelfItem.thumbSize(for: NSSize(width: 100, height: 10000))
-check(tall.height <= 240, "tall screenshots have a bounded thumbnail height")
-check(ShelfItem.thumbSize(for: NSSize(width: 2000, height: 1000)).width <= 320,
+check(tall.height <= 165, "tall screenshots have a bounded thumbnail height")
+check(ShelfItem.thumbSize(for: NSSize(width: 2000, height: 1000)).width <= 220,
       "wide screenshots retain the existing width bound")
 
 let root = FileManager.default.temporaryDirectory.appendingPathComponent("SnapShelf-regression-\(UUID().uuidString)")
@@ -128,6 +130,31 @@ try blue.write(to: other)
 let pb = NSPasteboard(name: .init("SnapShelf-regression-\(UUID().uuidString)"))
 defer { pb.releaseGlobally() }
 let clipboard = CaptureClipboard(pasteboard: pb)
+
+// Every SF Symbol main.swift uses (toolbar + transient states); a typo renders an empty button.
+let toolbarSymbols = ["doc.on.doc", "text.viewfinder", "crop", "pencil.tip.crop.circle", "link", "xmark",
+                      "checkmark", "ellipsis", "arrow.clockwise", "text.badge.xmark", "exclamationmark.triangle"]
+for symbol in toolbarSymbols {
+    check(NSImage(systemSymbolName: symbol, accessibilityDescription: nil) != nil, "SF Symbol \(symbol) resolves")
+}
+// Own subdirectory: the OCR-index tests below enumerate every PNG directly under root.
+let thumbRoot = root.appendingPathComponent("thumbs")
+try FileManager.default.createDirectory(at: thumbRoot, withIntermediateDirectories: true)
+let wideURL = thumbRoot.appendingPathComponent("wide.png"), narrowURL = thumbRoot.appendingPathComponent("narrow.png")
+let wideData = fixture(.green, size: NSSize(width: 1400, height: 880))
+let narrowData = fixture(.green, size: NSSize(width: 80, height: 240))
+try wideData.write(to: wideURL)
+try narrowData.write(to: narrowURL)
+let wideItem = ShelfItem(url: wideURL, image: NSImage(data: wideData)!, origin: .zero, clipboard: clipboard)
+let narrowItem = ShelfItem(url: narrowURL, image: NSImage(data: narrowData)!, origin: .zero, clipboard: clipboard)
+check(wideItem.testToolbarImages.allSatisfy { $0 != nil }, "every toolbar button shows a symbol")
+check(wideItem.testBarMinWidth <= 220, "icon toolbar fits within the maximum thumbnail width")
+check(wideItem.panel.frame.width <= 220, "wide screenshot panel stays within 220pt")
+check(wideItem.panel.frame.height - ShelfItem.barHeight <= 165, "wide screenshot thumbnail stays within 165pt tall")
+check(narrowItem.panel.frame.height - ShelfItem.barHeight <= 165, "tall screenshot thumbnail stays within 165pt tall")
+check(narrowItem.panel.frame.width >= max(170, narrowItem.testBarMinWidth), "narrow screenshot panel still fits the whole toolbar")
+wideItem.close()
+narrowItem.close()
 clipboard.copy(url)
 let oldCount = pb.changeCount
 try CaptureFiles.save(blue, to: url)

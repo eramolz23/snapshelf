@@ -10,7 +10,8 @@ Single Swift file, no dependencies, no Apple Developer account needed.
 
 - **Capture**: `⌃⌘2` area (press **Space** during selection for window capture),
   `⌃⌘1` full screen, or use the menu bar icon
-- **Pinned thumbnails** stack bottom-left, reflow after changes, and fit on screen.
+- **Pinned thumbnails** (max 220×165, icon toolbar — hover for names) stack bottom-left,
+  reflow after changes, and fit on screen.
   If the shelf fills up, older thumbnails remain available in Recent Captures and History.
 - **Auto-copy** — every capture is on the clipboard immediately. Saving edits refreshes
   its clipboard image while that capture still owns the clipboard.
@@ -18,8 +19,8 @@ Single Swift file, no dependencies, no Apple Developer account needed.
 - **Click** a thumbnail → big centered editor: pen, highlighter, arrow, box, text,
   blur/pixelate, solid black redaction, crop — with per-stroke width (S/M/L), color picker,
   and full undo (⌘Z). Each capture has one editor; dismissing thumbnails leaves edits open.
-- **OCR** button — on-device text recognition straight to the clipboard
-- **Link** button — uploads to [litterbox](https://litterbox.catbox.moe) and copies a
+- **OCR** icon — on-device text recognition straight to the clipboard
+- **Link** icon — uploads to [litterbox](https://litterbox.catbox.moe) and copies a
   share URL (public link, 72-hour expiry — use **Redact**, then **Done**, for secrets;
   Blur is cosmetic pixelation)
 - **History** window — searchable grid of every capture, including search by the
