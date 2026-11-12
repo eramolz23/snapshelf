@@ -589,6 +589,9 @@ final class EditorCanvas: NSView {
         super.keyDown(with: event)
     }
 
+    // Something applied that a save would keep. Undoing back to the original is clean again.
+    var hasEdits: Bool { !ops.isEmpty }
+
     func addMark(_ a: Annotation) {
         editGeneration += 1
         searchHighlights = []
@@ -697,7 +700,12 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     private var pendingTextPoint = NSPoint.zero
     var onClosed: (() -> Void)?
     var onSaveError: ((Error) -> Void)?
+    // Asked before closing with unsaved edits; call the handler with true to discard.
+    // nil shows the "Discard changes?" sheet. Tests inject the answer, like onSaveError.
+    var confirmDiscard: ((@escaping (Bool) -> Void) -> Void)?
     var editGeneration: Int { canvas.editGeneration }
+    // A mark or crop is applied, or the open text field has typed text in it.
+    var hasUnsavedChanges: Bool { canvas.hasEdits || !(activeField?.stringValue.isEmpty ?? true) }
 
     init(image: NSImage, tool: Tool, onSave: @escaping (Data) throws -> Void) {
         self.onSave = onSave
@@ -742,7 +750,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         cancelBtn.bezelStyle = .rounded
         cancelBtn.showsBorderOnlyWhileMouseInside = false
         cancelBtn.keyEquivalent = "\u{1b}"
-        cancelBtn.onClick = { [weak self] in self?.window.close() }
+        cancelBtn.onClick = { [weak self] in self?.requestClose() }
         cancelBtn.sizeToFit()
 
         let doneBtn = ActionButton(title: "Done")
@@ -785,8 +793,35 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
             : "\(rects.count) match\(rects.count == 1 ? "" : "es") for “\(query)”"
     }
 
+    // Cancel button (and Esc): same path as the red close button.
+    private func requestClose() {
+        if windowShouldClose(window) { window.close() }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard hasUnsavedChanges else { return true }
+        let decide: (Bool) -> Void = { [weak self] discard in
+            guard discard, let self else { return }
+            self.discardActiveField()
+            self.window.close()
+        }
+        if let confirmDiscard {
+            confirmDiscard(decide)
+        } else if window.attachedSheet == nil {
+            let alert = NSAlert()
+            alert.messageText = "Discard changes?"
+            alert.informativeText = "Your edits to this screenshot have not been saved."
+            alert.addButton(withTitle: "Discard")
+            alert.addButton(withTitle: "Keep Editing").keyEquivalent = "\u{1b}"
+            alert.beginSheetModal(for: window) { decide($0 == .alertFirstButtonReturn) }
+        }
+        return false
+    }
+
     private func saveAndClose() {
         commitActiveField()
+        // Nothing changed: close without re-encoding or rewriting the file.
+        guard canvas.hasEdits else { window.close(); return }
         do {
             guard let data = canvas.renderPNG() else { throw CocoaError(.fileWriteUnknown) }
             try onSave(data)
@@ -847,6 +882,13 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         guard !text.isEmpty else { return }
         canvas.addMark(.text(text, pendingTextPoint, canvas.color,
                              EditorCanvas.fontSize(for: canvas.image)))
+    }
+
+    // Drop the open text field without turning it into an annotation.
+    private func discardActiveField() {
+        guard let field = activeField else { return }
+        activeField = nil   // first, so the end-editing callback has nothing to commit
+        field.removeFromSuperview()
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -1776,13 +1818,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
-    @objc private func restartApp() {
+    // Quit/Restart with unsaved editor changes asks once. Tests inject the answer
+    // (true = quit anyway); nil shows the alert.
+    var confirmQuit: ((EditorController) -> Bool)?
+    private var quitConfirmed = false
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        quitConfirmed || confirmQuitIfNeeded() ? .terminateNow : .terminateCancel
+    }
+
+    private func confirmQuitIfNeeded() -> Bool {
+        guard let dirty = editors.values.first(where: { $0.hasUnsavedChanges }) else { return true }
+        let quit: Bool
+        if let confirmQuit {
+            quit = confirmQuit(dirty)
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "You have unsaved screenshot edits"
+            alert.informativeText = "Quitting now discards them."
+            alert.addButton(withTitle: "Quit Anyway")
+            alert.addButton(withTitle: "Cancel")
+            quit = alert.runModal() == .alertFirstButtonReturn
+        }
+        if !quit {
+            NSApp.activate(ignoringOtherApps: true)
+            dirty.window.makeKeyAndOrderFront(nil)
+        }
+        return quit
+    }
+
+    // Replaced in tests so a restart can be checked without spawning or terminating.
+    lazy var relaunch: () -> Void = {
         let path = Bundle.main.bundlePath
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
         p.arguments = ["-c", "sleep 0.5; /usr/bin/open \"\(path)\""]
         try? p.run()
         NSApp.terminate(nil)
+    }
+
+    @objc private func restartApp() {
+        // Ask before spawning the relaunch helper: a cancelled quit must not start a second copy.
+        guard confirmQuitIfNeeded() else { return }
+        quitConfirmed = true
+        relaunch()
     }
 
     // MARK: - Global hotkeys (Carbon — no Accessibility permission needed)

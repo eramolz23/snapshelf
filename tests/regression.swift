@@ -12,6 +12,16 @@ extension EditorController {
     func attemptTestSave() { saveAndClose() }
     func testMark(_ annotation: Annotation) { canvas.addMark(annotation) }
     var testHighlights: [NSRect] { canvas.searchHighlights }
+    func testUndo() { canvas.undo() }
+    func testCrop(_ rect: NSRect) { canvas.testCrop(rect) }
+    func testButton(_ title: String) -> NSButton? { findButton(title, in: window.contentView) }
+}
+
+func findButton(_ title: String, in view: NSView?) -> NSButton? {
+    guard let view else { return nil }
+    if let button = view as? NSButton, button.title == title { return button }
+    for sub in view.subviews { if let found = findButton(title, in: sub) { return found } }
+    return nil
 }
 
 extension EditorCanvas {
@@ -40,6 +50,7 @@ extension AppDelegate {
     func testSave(_ data: Data, to url: URL) throws { try saveCapture(data, to: url) }
     var testEditors: [URL: EditorController] { editors }
     var testItems: [ShelfItem] { items }
+    func testRestart() { restartApp() }
 }
 
 extension HistoryWindow {
@@ -111,6 +122,7 @@ let invalidEditor = EditorController(image: NSImage(size: .zero), tool: .pen) { 
 var renderErrorShown = false
 invalidEditor.onSaveError = { _ in renderErrorShown = true }
 invalidEditor.onClosed = { closedAfterFailedRender = true }
+invalidEditor.testMark(.box(NSRect(x: 0, y: 0, width: 1, height: 1), .red))   // Done with no edits just closes
 invalidEditor.attemptTestSave()
 check(!closedAfterFailedRender, "failed rendering retains the editor")
 check(renderErrorShown, "failed rendering reports the save error")
@@ -255,6 +267,7 @@ let failedEditor = EditorController(image: NSImage(data: red)!, tool: .pen) { da
 }
 failedEditor.onSaveError = { _ in saveFailed = true }
 failedEditor.onClosed = { closedAfterFailedWrite = true }
+failedEditor.testMark(.box(NSRect(x: 10, y: 10, width: 20, height: 20), .blue))   // Done with no edits just closes
 failedEditor.attemptTestSave()
 check(saveFailed && !closedAfterFailedWrite, "missing destination reports failure and keeps the editor open")
 check(!FileManager.default.fileExists(atPath: root.appendingPathComponent("missing.png").path),
@@ -577,6 +590,83 @@ try CaptureFiles.save(blue, to: url)
 watched.close()
 drain(0.4)
 check(!watched.testWatching, "close during atomic-save notification cancels watcher rearm")
+
+// Unsaved-edit protection: Cancel, Esc and the red close button ask only when dirty.
+var discardAsked = 0
+var discardAnswer = false
+var unsavedClosed = 0
+var unsavedSaves = 0
+func unsavedEditor() -> EditorController {
+    let e = EditorController(image: NSImage(data: red)!, tool: .pen) { _ in unsavedSaves += 1 }
+    e.confirmDiscard = { decide in discardAsked += 1; decide(discardAnswer) }
+    e.onClosed = { unsavedClosed += 1 }
+    return e
+}
+let cleanEditor = unsavedEditor()
+check(!cleanEditor.hasUnsavedChanges && cleanEditor.windowShouldClose(cleanEditor.window) && discardAsked == 0,
+      "a clean editor closes without asking")
+cleanEditor.testMark(.box(NSRect(x: 10, y: 10, width: 20, height: 20), .red))
+cleanEditor.testUndo()
+check(!cleanEditor.hasUnsavedChanges, "adding then undoing a mark leaves the editor clean")
+cleanEditor.testCrop(NSRect(x: 10, y: 10, width: 40, height: 40))
+check(cleanEditor.hasUnsavedChanges, "a crop marks the editor dirty")
+cleanEditor.testUndo()
+check(!cleanEditor.hasUnsavedChanges, "undoing the crop leaves the editor clean")
+cleanEditor.testButton("Cancel")?.performClick(nil)
+check(unsavedClosed == 1 && discardAsked == 0, "Cancel on a clean editor closes immediately")
+
+let dirtyEditor = unsavedEditor()
+dirtyEditor.testMark(.box(NSRect(x: 10, y: 10, width: 20, height: 20), .red))
+discardAnswer = false
+dirtyEditor.testButton("Cancel")?.performClick(nil)
+check(discardAsked == 1 && unsavedClosed == 1, "Cancel on a dirty editor asks and Keep Editing keeps it open")
+check(dirtyEditor.testButton("Cancel")?.keyEquivalent == "\u{1b}", "Esc still triggers the guarded Cancel button")
+dirtyEditor.window.performClose(nil)
+check(discardAsked == 2 && unsavedClosed == 1, "the red close button on a dirty editor asks first")
+discardAnswer = true
+dirtyEditor.window.performClose(nil)
+check(discardAsked == 3 && unsavedClosed == 2 && unsavedSaves == 0, "Discard closes the dirty editor without saving")
+
+let untouchedEditor = unsavedEditor()
+untouchedEditor.testButton("Done")?.performClick(nil)
+check(unsavedClosed == 3 && unsavedSaves == 0, "Done with no changes closes without re-encoding")
+
+let unsavedDir = root.appendingPathComponent("unsaved", isDirectory: true)
+try FileManager.default.createDirectory(at: unsavedDir, withIntermediateDirectories: true)
+let unsavedURL = unsavedDir.appendingPathComponent("untouched.png")
+try red.write(to: unsavedURL)
+let untouchedRevision = fileRevision(unsavedURL)
+let quitApp = AppDelegate(directory: unsavedDir, pasteboard: pb)
+quitApp.testEdit(unsavedURL)
+quitApp.testEditors[unsavedURL]!.testButton("Done")?.performClick(nil)
+check(quitApp.testEditors.isEmpty && fileRevision(unsavedURL) == untouchedRevision,
+      "Done with no changes leaves the capture file untouched")
+
+var quitAsked = 0
+var quitAnswer = false
+var relaunches = 0
+quitApp.confirmQuit = { _ in quitAsked += 1; return quitAnswer }
+quitApp.relaunch = { relaunches += 1 }
+check(quitApp.applicationShouldTerminate(testApp) == .terminateNow && quitAsked == 0,
+      "quitting without open edits does not ask")
+quitApp.testEdit(unsavedURL)
+let quitEditor = quitApp.testEditors[unsavedURL]!
+check(quitApp.applicationShouldTerminate(testApp) == .terminateNow && quitAsked == 0,
+      "quitting with a clean editor open does not ask")
+quitEditor.testMark(.box(NSRect(x: 10, y: 10, width: 20, height: 20), .red))
+check(quitApp.applicationShouldTerminate(testApp) == .terminateCancel && quitAsked == 1
+      && quitApp.testEditors[unsavedURL] === quitEditor && quitEditor.window.isVisible,
+      "Cancel on the quit prompt keeps the app and the dirty editor")
+quitApp.testRestart()
+check(quitAsked == 2 && relaunches == 0, "cancelled restart never spawns the relaunch helper")
+quitAnswer = true
+check(quitApp.applicationShouldTerminate(testApp) == .terminateNow && quitAsked == 3,
+      "Quit Anyway lets termination proceed")
+quitApp.testRestart()
+check(quitAsked == 4 && relaunches == 1, "confirmed restart relaunches once")
+check(quitApp.applicationShouldTerminate(testApp) == .terminateNow && quitAsked == 4,
+      "termination after a confirmed restart does not ask twice")
+quitEditor.close()
 
 if failures > 0 { exit(1) }
 print("All regression checks passed")
