@@ -138,7 +138,8 @@ let clipboard = CaptureClipboard(pasteboard: pb)
 
 // Every SF Symbol main.swift uses (toolbar + transient states); a typo renders an empty button.
 let toolbarSymbols = ["doc.on.doc", "text.viewfinder", "crop", "pencil.tip.crop.circle", "link", "xmark",
-                      "checkmark", "ellipsis", "arrow.clockwise", "text.badge.xmark", "exclamationmark.triangle"]
+                      "checkmark", "ellipsis", "arrow.clockwise", "text.badge.xmark", "exclamationmark.triangle",
+                      "arrow.up.circle.fill"]
 for symbol in toolbarSymbols {
     check(NSImage(systemSymbolName: symbol, accessibilityDescription: nil) != nil, "SF Symbol \(symbol) resolves")
 }
@@ -201,6 +202,30 @@ buttons[0].setSymbol("checkmark", label: "Copied")
 buttons[0].setSymbol("doc.on.doc", label: "Copy")
 check(bar.shown, "feedback ending while the mouse is over the card leaves the controls up")
 wideItem.testHover(false)
+// Share Link is two-step: the first click only arms; a second click while armed uploads.
+ShelfItem.linkArmSeconds = 0.2
+var linkUploads = 0
+let linkButton = buttons[4]
+wideItem.uploadLink = { linkUploads += 1; linkButton.setSymbol("link", label: "Share Link (72h)") }
+linkButton.performClick(nil)
+check(linkUploads == 0 && linkButton.symbol == ShelfItem.armedLinkSymbol
+      && linkButton.toolTip == "Click again to upload a public link", "one Share Link click arms without uploading")
+check(bar.shown, "armed Share Link keeps the controls visible after the mouse leaves")
+linkButton.performClick(nil)
+check(linkUploads == 1, "a second Share Link click while armed uploads")
+linkButton.performClick(nil)
+waitUntil("Share Link arming expires back to the idle icon", { linkButton.symbol == "link" })
+check(linkUploads == 1 && !bar.shown, "an expired arm uploads nothing and releases the controls")
+linkButton.performClick(nil)
+check(linkUploads == 1 && linkButton.symbol == ShelfItem.armedLinkSymbol, "a click after the arm expired only re-arms")
+waitUntil("re-armed Share Link expires", { linkButton.symbol == "link" })
+let linkOK = ShelfItem.shareResult(link: "https://x.test/a.png", status: 200, fileUnchanged: true, clipboardUnchanged: true)
+check(linkOK.copy && linkOK.symbol == "checkmark", "unchanged file and clipboard copy the uploaded link")
+let linkChanged = ShelfItem.shareResult(link: "https://x.test/a.png", status: 200, fileUnchanged: false, clipboardUnchanged: true)
+check(!linkChanged.copy && linkChanged.symbol == "exclamationmark.triangle"
+      && linkChanged.label == "File changed during upload — link not copied", "file changed during upload says so and copies nothing")
+let linkFailed = ShelfItem.shareResult(link: nil, status: nil, fileUnchanged: true, clipboardUnchanged: true)
+check(!linkFailed.copy && linkFailed.label == "Upload failed", "network failure still reports Upload failed")
 wideItem.close()
 narrowItem.close()
 clipboard.copy(url)

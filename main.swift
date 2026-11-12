@@ -1034,6 +1034,12 @@ final class ShelfItem: NSObject {
     private var watcher: DispatchSourceFileSystemObject?
     private var closed = false
     private var visibleFrame: NSRect
+    // Share Link is two-step: the first click arms, a second click within linkArmSeconds uploads.
+    static let armedLinkSymbol = "arrow.up.circle.fill"
+    static var linkArmSeconds: TimeInterval = 4
+    // Bumped on every link-button state change, so a stale delayed reset never reverts a newer state.
+    private var linkGeneration = 0
+    lazy var uploadLink: () -> Void = { [weak self] in self?.shareLink() }
 
     static func thumbSize(for imageSize: NSSize, maximum: NSSize = NSSize(width: maxThumbWidth, height: maxThumbHeight)) -> NSSize {
         let scale = min(1, maximum.width / max(imageSize.width, 1), maximum.height / max(imageSize.height, 1))
@@ -1104,7 +1110,7 @@ final class ShelfItem: NSObject {
         ocrBtn.onClick = { [weak self] in self?.runOCR() }
         cropBtn.onClick = { [weak self] in self?.openEditor(tool: .crop) }
         markupBtn.onClick = { [weak self] in self?.openEditor(tool: .pen) }
-        linkBtn.onClick = { [weak self] in self?.shareLink() }
+        linkBtn.onClick = { [weak self] in self?.linkClicked() }
         closeBtn.onClick = { [weak self] in self?.close() }
 
         container.addSubview(thumbView)
@@ -1217,14 +1223,52 @@ final class ShelfItem: NSObject {
     }
 
     // Upload to litterbox (catbox.moe's temp host, no account needed) and copy the URL.
+    // The upload is public, so one stray click must not send it: arm first, upload on the second.
+    private func linkClicked() {
+        if linkBtn.symbol == ShelfItem.armedLinkSymbol {
+            linkGeneration += 1
+            uploadLink()
+            return
+        }
+        guard linkBtn.symbol != "ellipsis" else { return }   // an upload is already in flight
+        linkGeneration += 1
+        let generation = linkGeneration
+        linkBtn.setSymbol(ShelfItem.armedLinkSymbol, label: "Click again to upload a public link")
+        DispatchQueue.main.asyncAfter(deadline: .now() + ShelfItem.linkArmSeconds) { [weak self] in
+            guard let self, self.linkGeneration == generation,
+                  self.linkBtn.symbol == ShelfItem.armedLinkSymbol else { return }
+            self.linkBtn.setSymbol("link", label: "Share Link (72h)")
+        }
+    }
+
+    private func showLinkResult(_ symbol: String, label: String) {
+        linkGeneration += 1
+        let generation = linkGeneration
+        linkBtn.setSymbol(symbol, label: label)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, self.linkGeneration == generation else { return }
+            self.linkBtn.setSymbol("link", label: "Share Link (72h)")
+        }
+    }
+
+    // nil link/status = the upload failed. Only an unchanged file and clipboard get the link copied.
+    static func shareResult(link: String?, status: Int?, fileUnchanged: Bool,
+                            clipboardUnchanged: Bool) -> (copy: Bool, symbol: String, label: String) {
+        guard let link, link.hasPrefix("http"), status == 200 else {
+            return (false, "exclamationmark.triangle", "Upload failed")
+        }
+        guard fileUnchanged else {
+            return (false, "exclamationmark.triangle", "File changed during upload — link not copied")
+        }
+        guard clipboardUnchanged else { return (false, "exclamationmark.triangle", "Upload failed") }
+        return (true, "checkmark", "Link copied")
+    }
+
     // Anyone with the link can view it, so redact secrets first; expires after 72 hours.
     private func shareLink() {
         linkBtn.setSymbol("ellipsis", label: "Working…")
         guard let fileData = try? Data(contentsOf: url) else {
-            linkBtn.setSymbol("exclamationmark.triangle", label: "Upload failed")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                self?.linkBtn.setSymbol("link", label: "Share Link (72h)")
-            }
+            showLinkResult("exclamationmark.triangle", label: "Upload failed")
             return
         }
         let revision = fileRevision(url)
@@ -1233,7 +1277,8 @@ final class ShelfItem: NSObject {
         req.httpMethod = "POST"
         let boundary = "snapshelf-\(UUID().uuidString)"
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        req.setValue("SnapShelf/1.0", forHTTPHeaderField: "User-Agent")
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        req.setValue("SnapShelf/\(version)", forHTTPHeaderField: "User-Agent")
         var body = Data()
         body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n".data(using: .utf8)!)
         body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"time\"\r\n\r\n72h\r\n".data(using: .utf8)!)
@@ -1245,18 +1290,12 @@ final class ShelfItem: NSObject {
                 guard let self, !self.closed else { return }
                 let link = data.flatMap { String(data: $0, encoding: .utf8) }?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if let link, link.hasPrefix("http"),
-                   revision != nil, fileRevision(self.url) == revision,
-                   self.clipboard.currentChangeCount == clipboardCount,
-                   (response as? HTTPURLResponse)?.statusCode == 200 {
-                    self.clipboard.copyText(link)
-                    self.linkBtn.setSymbol("checkmark", label: "Link copied")
-                } else {
-                    self.linkBtn.setSymbol("exclamationmark.triangle", label: "Upload failed")
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    self.linkBtn.setSymbol("link", label: "Share Link (72h)")
-                }
+                let result = ShelfItem.shareResult(
+                    link: link, status: (response as? HTTPURLResponse)?.statusCode,
+                    fileUnchanged: revision != nil && fileRevision(self.url) == revision,
+                    clipboardUnchanged: self.clipboard.currentChangeCount == clipboardCount)
+                if result.copy, let link { self.clipboard.copyText(link) }
+                self.showLinkResult(result.symbol, label: result.label)
             }
         }.resume()
     }
