@@ -55,6 +55,9 @@ extension AppDelegate {
     var testEditors: [URL: EditorController] { editors }
     var testItems: [ShelfItem] { items }
     func testRestart() { restartApp() }
+    func testCaptureFinished(_ url: URL, status: Int32) { captureFinished(url: url, status: status, reason: .exit) }
+    func testScheduleCleanup() { scheduleCleanup() }
+    var testCleanupTimer: Timer? { cleanupTimer }
 }
 
 extension HistoryWindow {
@@ -741,6 +744,84 @@ check(closeItem.flatMap { item in (keysWindow.firstResponder as NSResponder?)?.t
 let keysBefore = fileRevision(keysURL)
 press(key("\r", 36, in: keysWindow), in: keysWindow)
 check(keysApp.testEditors.isEmpty && fileRevision(keysURL) != keysBefore, "Return with no open field is Done and saves")
+
+// S4: hotkey failures show on the menu; a failed capture explains Screen Recording only
+// when access is missing, at most once per interval, and access is checked only after a failure.
+check(captureMenuTitle("Capture Area", hotkeyID: 1, failed: []) == "Capture Area"
+      && captureMenuTitle("Capture Area", hotkeyID: 1, failed: [2]) == "Capture Area",
+      "capture menu titles are unchanged when their shortcut registered")
+check(captureMenuTitle("Capture Full Screen", hotkeyID: 2, failed: [2]) == "Capture Full Screen — shortcut unavailable",
+      "a shortcut that failed to register is flagged on its menu item")
+var accessAsked = 0
+let noAccess: () -> Bool = { accessAsked += 1; return false }
+let t0 = Date()
+check(!CapturePermission.shouldExplain(captureFailed: false, hasAccess: noAccess, lastShown: nil, now: t0) && accessAsked == 0,
+      "a successful capture never checks or explains Screen Recording access")
+check(!CapturePermission.shouldExplain(captureFailed: true, hasAccess: { true }, lastShown: nil, now: t0),
+      "a failed capture with access granted does not explain permissions")
+check(CapturePermission.shouldExplain(captureFailed: true, hasAccess: noAccess, lastShown: nil, now: t0),
+      "a failed capture without access explains Screen Recording")
+check(!CapturePermission.shouldExplain(captureFailed: true, hasAccess: noAccess, lastShown: t0, now: t0.addingTimeInterval(9 * 60))
+      && CapturePermission.shouldExplain(captureFailed: true, hasAccess: noAccess, lastShown: t0, now: t0.addingTimeInterval(10 * 60)),
+      "the permission explanation is rate-limited to once per ten minutes")
+check(CapturePermission.settingsURL.absoluteString
+      == "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+      "the explanation opens the Screen Recording pane of System Settings")
+
+let captureDir = root.appendingPathComponent("capture")
+try FileManager.default.createDirectory(at: captureDir, withIntermediateDirectories: true)
+let captureApp = AppDelegate(directory: captureDir, pasteboard: pb)
+var captureAccessAsked = 0, explained = 0, captureAccess = false
+captureApp.hasScreenCaptureAccess = { captureAccessAsked += 1; return captureAccess }
+captureApp.explainPermission = { explained += 1 }
+let goodCapture = captureDir.appendingPathComponent("good.png")
+try red.write(to: goodCapture)
+captureApp.testCaptureFinished(goodCapture, status: 0)
+check(captureApp.testItems.count == 1 && captureAccessAsked == 0 && explained == 0,
+      "a successful capture pins its thumbnail without touching the permission check")
+let failedCapture = captureDir.appendingPathComponent("failed.png")
+try Data("not a png".utf8).write(to: failedCapture)
+captureApp.testCaptureFinished(failedCapture, status: 1)
+check(!FileManager.default.fileExists(atPath: failedCapture.path) && captureAccessAsked == 1 && explained == 1,
+      "a failed capture without access removes the partial file and explains once")
+captureApp.testCaptureFinished(failedCapture, status: 1)
+check(captureAccessAsked == 2 && explained == 1, "a second failure inside the interval does not explain again")
+let grantedApp = AppDelegate(directory: captureDir, pasteboard: pb)
+var grantedExplained = 0
+grantedApp.hasScreenCaptureAccess = { true }
+grantedApp.explainPermission = { grantedExplained += 1 }
+grantedApp.testCaptureFinished(failedCapture, status: 1)
+check(grantedExplained == 0 && grantedApp.testItems.isEmpty, "a cancelled capture with access granted stays silent")
+captureApp.testDismiss()
+
+// S7: old captures are cleaned at launch and again every 24 hours, sparing an open editor.
+let cleanupDir = root.appendingPathComponent("cleanup")
+try FileManager.default.createDirectory(at: cleanupDir, withIntermediateDirectories: true)
+func agedCapture(_ name: String, days: Double) throws -> URL {
+    let u = cleanupDir.appendingPathComponent(name)
+    try red.write(to: u)
+    try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-days * 86400)], ofItemAtPath: u.path)
+    return u
+}
+let staleAtLaunch = try agedCapture("stale-launch.png", days: 61)
+let freshCapture = try agedCapture("fresh.png", days: 1)
+let cleanupApp = AppDelegate(directory: cleanupDir, pasteboard: pb)
+cleanupApp.testScheduleCleanup()
+check(waitUntil("launch cleanup") { !FileManager.default.fileExists(atPath: staleAtLaunch.path) }
+      && FileManager.default.fileExists(atPath: freshCapture.path), "launch cleanup removes only captures past the age limit")
+let cleanupTimer = cleanupApp.testCleanupTimer
+check(cleanupTimer?.isValid == true && cleanupTimer?.timeInterval == 86400, "cleanup repeats every 24 hours")
+let staleLater = try agedCapture("stale-later.png", days: 61)
+let staleEditing = try agedCapture("stale-editing.png", days: 61)
+// Open it the way History does, by its directory-listing URL: under the test temp dir that
+// spelling is /private/var/..., which is how cleanup sees it too.
+cleanupApp.testEdit(capturedFiles(in: cleanupDir).first { $0.lastPathComponent == "stale-editing.png" }!)
+cleanupTimer?.fire()
+check(waitUntil("daily cleanup") { !FileManager.default.fileExists(atPath: staleLater.path) }
+      && FileManager.default.fileExists(atPath: staleEditing.path) && FileManager.default.fileExists(atPath: freshCapture.path),
+      "the daily cleanup removes newly stale captures and spares one open in the editor")
+cleanupTimer?.invalidate()
+cleanupApp.testEditors.values.forEach { $0.close() }
 
 if failures > 0 { exit(1) }
 print("All regression checks passed")

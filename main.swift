@@ -14,7 +14,8 @@ import Vision
 private let maxThumbWidth: CGFloat = 220
 private let maxThumbHeight: CGFloat = 165
 private let screenMargin: CGFloat = 16
-private let autoCleanupDays = 60   // captures older than this are deleted at launch
+private let autoCleanupDays = 60   // captures older than this are deleted at launch and daily
+private let autoCleanupInterval: TimeInterval = 24 * 60 * 60
 
 // Newest-first list of every saved capture.
 private func capturedFiles(in directory: URL = saveDir) -> [URL] {
@@ -277,6 +278,27 @@ private let hotkeys: [(keyCode: Int, modifiers: Int, id: UInt32)] = [
     (kVK_ANSI_2, cmdKey | controlKey, 1),
     (kVK_ANSI_1, cmdKey | controlKey, 2),
 ]
+
+// A shortcut another app already owns can't be registered. Say so on its status-menu
+// item rather than failing silently; no alert at launch.
+func captureMenuTitle(_ title: String, hotkeyID: UInt32, failed: Set<UInt32>) -> String {
+    failed.contains(hotkeyID) ? title + " — shortcut unavailable" : title
+}
+
+// After a failed capture, explain Screen Recording only when access is actually missing,
+// and at most once per interval. Access is checked only after a failure (hasAccess is
+// lazy), and a capture is never blocked or skipped because of it.
+enum CapturePermission {
+    static let settingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
+    static let explainInterval: TimeInterval = 10 * 60
+
+    static func shouldExplain(captureFailed: Bool, hasAccess: () -> Bool, lastShown: Date?,
+                              now: Date, interval: TimeInterval = explainInterval) -> Bool {
+        guard captureFailed, !hasAccess() else { return false }
+        guard let lastShown else { return true }
+        return now.timeIntervalSince(lastShown) >= interval
+    }
+}
 
 final class ActionButton: NSButton {
     var onClick: (() -> Void)?
@@ -1724,6 +1746,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var items: [ShelfItem] = []
     private var hotKeyRefs: [EventHotKeyRef?] = []
+    private var hotkeyFailures: Set<UInt32> = []
+    private var areaItem: NSMenuItem!
+    private var fullItem: NSMenuItem!
+    // Screen Recording explanation after a failed capture. Injectable for tests.
+    var hasScreenCaptureAccess: () -> Bool = { CGPreflightScreenCaptureAccess() }
+    var explainPermission: (() -> Void)?
+    private var permissionExplainedAt: Date?
+    private var cleanupTimer: Timer?
     private var loginItem: NSMenuItem!
     private let recentMenu = NSMenu()
     private let history: HistoryWindow
@@ -1752,6 +1782,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let full = NSMenuItem(title: "Capture Full Screen", action: #selector(captureFull), keyEquivalent: "1")
         full.keyEquivalentModifierMask = [.command, .control]
         full.target = self
+        areaItem = area
+        fullItem = full
         let clear = NSMenuItem(title: "Dismiss All Thumbnails", action: #selector(dismissAll), keyEquivalent: "")
         clear.target = self
         let restart = NSMenuItem(title: "Restart SnapShelf", action: #selector(restartApp), keyEquivalent: "r")
@@ -1788,7 +1820,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         history.onPreview = { [weak self] url, query in self?.openSearchPreview(url: url, query: query) }
         NotificationCenter.default.addObserver(self, selector: #selector(reflowShelf),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        scheduleCleanup()
+    }
+
+    // Once at launch, then daily, so an app left running for weeks still ages captures out.
+    private func scheduleCleanup() {
         cleanupOldCaptures()
+        cleanupTimer?.invalidate()
+        cleanupTimer = Timer.scheduledTimer(withTimeInterval: autoCleanupInterval, repeats: true) { [weak self] _ in
+            self?.cleanupOldCaptures()
+        }
     }
 
     @objc private func openHistory() { history.open() }
@@ -1945,8 +1986,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                              EventHotKeyID(signature: sig, id: hk.id),
                                              GetEventDispatcherTarget(), 0, &ref)
             hotKeyRefs.append(ref)
+            if status != noErr { hotkeyFailures.insert(hk.id) }
             NSLog("SnapShelf hotkey %d (action %d) registered: %d (0 = ok)", i, hk.id, status)
         }
+        areaItem.title = captureMenuTitle("Capture Area", hotkeyID: 1, failed: hotkeyFailures)
+        fullItem.title = captureMenuTitle("Capture Full Screen", hotkeyID: 2, failed: hotkeyFailures)
     }
 
     // MARK: - Capture
@@ -1962,16 +2006,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         p.arguments = (interactive ? ["-i"] : ["-m"]) + [url.path]
         p.terminationHandler = { [weak self] process in
             DispatchQueue.main.async {
-                guard CaptureFiles.succeeded(at: url, status: process.terminationStatus,
-                                             reason: process.terminationReason) else {
-                    try? FileManager.default.removeItem(at: url)
-                    return
-                }
-                self?.showThumb(for: url)
+                self?.captureFinished(url: url, status: process.terminationStatus,
+                                      reason: process.terminationReason)
             }
         }
         do { try p.run() }
         catch { NSLog("SnapShelf capture could not start: %@", error.localizedDescription) }
+    }
+
+    private func captureFinished(url: URL, status: Int32, reason: Process.TerminationReason) {
+        guard CaptureFiles.succeeded(at: url, status: status, reason: reason) else {
+            try? FileManager.default.removeItem(at: url)
+            explainPermissionIfNeeded()
+            return
+        }
+        showThumb(for: url)
+    }
+
+    // Never requests access (no system prompt from here) and never stops a capture.
+    private func explainPermissionIfNeeded() {
+        let now = Date()
+        guard CapturePermission.shouldExplain(captureFailed: true, hasAccess: hasScreenCaptureAccess,
+                                              lastShown: permissionExplainedAt, now: now) else { return }
+        permissionExplainedAt = now
+        if let explainPermission { explainPermission(); return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "SnapShelf needs Screen Recording permission"
+        alert.informativeText = "The screenshot didn’t work because SnapShelf isn’t allowed to record the screen. "
+            + "Turn on SnapShelf in System Settings › Privacy & Security › Screen Recording, then restart SnapShelf."
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Not Now")
+        if alert.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(CapturePermission.settingsURL) }
     }
 
     // MARK: - Thumbnail shelf
