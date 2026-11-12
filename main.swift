@@ -339,6 +339,12 @@ final class ActionButton: NSButton {
         layer?.backgroundColor = nil
     }
     @objc private func clicked() { onClick?() }
+    // Editor Done/Cancel: Return and Esc belong to an open text field first.
+    var allowsKeyEquivalent: (() -> Bool)?
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if let allowsKeyEquivalent, !allowsKeyEquivalent() { return false }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 // MARK: - Annotations
@@ -751,6 +757,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         cancelBtn.showsBorderOnlyWhileMouseInside = false
         cancelBtn.keyEquivalent = "\u{1b}"
         cancelBtn.onClick = { [weak self] in self?.requestClose() }
+        cancelBtn.allowsKeyEquivalent = { [weak self] in self?.activeField == nil }
         cancelBtn.sizeToFit()
 
         let doneBtn = ActionButton(title: "Done")
@@ -758,6 +765,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         doneBtn.showsBorderOnlyWhileMouseInside = false
         doneBtn.keyEquivalent = "\r"
         doneBtn.onClick = { [weak self] in self?.saveAndClose() }
+        doneBtn.allowsKeyEquivalent = { [weak self] in self?.activeField == nil }
         doneBtn.sizeToFit()
 
         let container = EditorContainer(canvas: canvas, barHeight: barH,
@@ -873,6 +881,22 @@ final class EditorController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     }
 
     func controlTextDidEndEditing(_ obj: Notification) { commitActiveField() }
+
+    // In the text field, Return commits the annotation and Esc drops it. Neither closes
+    // the editor; with no field open they keep meaning Done and Cancel.
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard control === activeField else { return false }
+        switch commandSelector {
+        case #selector(NSResponder.insertNewline(_:)):
+            commitActiveField()
+        case #selector(NSResponder.cancelOperation(_:)):
+            discardActiveField()
+        default:
+            return false
+        }
+        window.makeFirstResponder(canvas)
+        return true
+    }
 
     private func commitActiveField() {
         guard let field = activeField else { return }
@@ -1666,6 +1690,34 @@ final class HistoryContainer: NSView {
     }
 }
 
+// MARK: - Main menu
+// Never visible (accessory app), but its key equivalents give the editor's text field and
+// the History search field Cut/Copy/Paste/Select All, and every window ⌘W. No Undo/Redo:
+// EditorCanvas.keyDown owns ⌘Z. No ⌘Q: quitting stays in the status menu.
+
+func makeMainMenu() -> NSMenu {
+    let main = NSMenu()
+    let appItem = NSMenuItem()
+    appItem.submenu = NSMenu(title: "SnapShelf")
+    main.addItem(appItem)
+
+    let edit = NSMenu(title: "Edit")
+    edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    let editItem = NSMenuItem()
+    editItem.submenu = edit
+    main.addItem(editItem)
+
+    let window = NSMenu(title: "Window")
+    window.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+    let windowItem = NSMenuItem()
+    windowItem.submenu = window
+    main.addItem(windowItem)
+    return main
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -1722,6 +1774,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(restart)
         menu.addItem(NSMenuItem(title: "Quit SnapShelf", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
+        NSApp.mainMenu = makeMainMenu()
 
         registerHotkeys()
 

@@ -15,6 +15,10 @@ extension EditorController {
     func testUndo() { canvas.undo() }
     func testCrop(_ rect: NSRect) { canvas.testCrop(rect) }
     func testButton(_ title: String) -> NSButton? { findButton(title, in: window.contentView) }
+    func testBeginText(at point: NSPoint) { beginText(at: point) }
+    var testActiveField: NSTextField? { activeField }
+    var testMarkCount: Int { canvas.marks.count }
+    var testCanvasFocused: Bool { window.firstResponder === canvas }
 }
 
 func findButton(_ title: String, in view: NSView?) -> NSButton? {
@@ -667,6 +671,76 @@ check(quitAsked == 4 && relaunches == 1, "confirmed restart relaunches once")
 check(quitApp.applicationShouldTerminate(testApp) == .terminateNow && quitAsked == 4,
       "termination after a confirmed restart does not ask twice")
 quitEditor.close()
+
+// Main menu + text tool keys: real key events through AppKit's key-equivalent routing.
+testApp.mainMenu = makeMainMenu()
+func allItems(_ menu: NSMenu?) -> [NSMenuItem] {
+    (menu?.items ?? []).flatMap { [$0] + allItems($0.submenu) }
+}
+let menuKeyItems = allItems(testApp.mainMenu).filter { !$0.keyEquivalent.isEmpty }
+check(Set(menuKeyItems.map(\.keyEquivalent)) == ["x", "c", "v", "a", "w"]
+      && menuKeyItems.allSatisfy { $0.keyEquivalentModifierMask == .command },
+      "main menu has only ⌘X/C/V/A/W: no Undo, no Quit, nothing shared with the status menu")
+check(menuKeyItems.map { $0.action.map(NSStringFromSelector) ?? "" }
+      == ["cut:", "copy:", "paste:", "selectAll:", "performClose:"], "main menu items send the standard actions")
+func key(_ chars: String, _ keyCode: UInt16, _ modifiers: NSEvent.ModifierFlags = [], in window: NSWindow) -> NSEvent {
+    NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
+                     timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                     context: nil, characters: chars, charactersIgnoringModifiers: chars,
+                     isARepeat: false, keyCode: keyCode)!
+}
+// NSApplication.sendEvent order: the key window's views, then the main menu, then the window.
+func press(_ event: NSEvent, in window: NSWindow) {
+    if window.performKeyEquivalent(with: event) { return }
+    if testApp.mainMenu?.performKeyEquivalent(with: event) == true { return }
+    window.sendEvent(event)
+}
+let keysURL = unsavedDir.appendingPathComponent("keys.png")
+try red.write(to: keysURL)
+let keysApp = AppDelegate(directory: unsavedDir, pasteboard: pb)
+keysApp.testEdit(keysURL)
+let keysEditor = keysApp.testEditors[keysURL]!
+let keysWindow = keysEditor.window
+var keysAsked = 0
+keysEditor.confirmDiscard = { _ in keysAsked += 1 }
+keysWindow.makeKeyAndOrderFront(nil)
+keysEditor.testMark(.box(NSRect(x: 10, y: 10, width: 20, height: 20), .red))
+keysWindow.makeFirstResponder(keysWindow.initialFirstResponder)
+press(key("z", 6, .command, in: keysWindow), in: keysWindow)
+check(keysEditor.testMarkCount == 0 && !keysEditor.hasUnsavedChanges, "⌘Z still undoes in the editor with the main menu installed")
+
+keysEditor.testBeginText(at: NSPoint(x: 20, y: 20))
+for (c, code) in [("h", UInt16(4)), ("i", UInt16(34))] { press(key(c, code, in: keysWindow), in: keysWindow) }
+let typedField = keysEditor.testActiveField
+check(typedField?.stringValue == "hi" && keysEditor.hasUnsavedChanges, "typed text in an open field counts as unsaved")
+// The test process is never the active app, so there is no key window for a nil-target
+// menu action to reach: send the ⌘A item's action up the focused responder chain instead.
+let fieldEditor = typedField?.currentEditor() as? NSTextView
+let selectAllItem = menuKeyItems.first { $0.keyEquivalent == "a" && $0.keyEquivalentModifierMask == .command }
+check(selectAllItem.flatMap { item in fieldEditor?.tryToPerform(item.action!, with: item) } == true
+      && fieldEditor?.selectedRange() == NSRange(location: 0, length: 2),
+      "⌘A in a text field selects all through the main menu")
+press(key("\r", 36, in: keysWindow), in: keysWindow)
+check(keysEditor.testActiveField == nil && keysEditor.testMarkCount == 1 && keysWindow.isVisible
+      && keysApp.testEditors[keysURL] === keysEditor && keysEditor.testCanvasFocused,
+      "Return in the text field commits the annotation without closing the editor")
+check(fileRevision(keysURL) != nil && keysAsked == 0, "Return in the text field does not trigger Done or Cancel")
+
+keysEditor.testBeginText(at: NSPoint(x: 30, y: 30))
+press(key("x", 7, in: keysWindow), in: keysWindow)
+press(key("\u{1b}", 53, in: keysWindow), in: keysWindow)
+check(keysEditor.testActiveField == nil && keysEditor.testMarkCount == 1 && keysWindow.isVisible
+      && keysAsked == 0 && keysEditor.testCanvasFocused,
+      "Esc in the text field drops it without committing or closing the editor")
+
+press(key("\u{1b}", 53, in: keysWindow), in: keysWindow)
+check(keysAsked == 1 && keysWindow.isVisible, "Esc with no open field is Cancel and asks about unsaved edits")
+let closeItem = menuKeyItems.first { $0.keyEquivalent == "w" }
+check(closeItem.flatMap { item in (keysWindow.firstResponder as NSResponder?)?.tryToPerform(item.action!, with: item) } == true
+      && keysAsked == 2 && keysWindow.isVisible, "⌘W on a dirty editor goes through the discard prompt")
+let keysBefore = fileRevision(keysURL)
+press(key("\r", 36, in: keysWindow), in: keysWindow)
+check(keysApp.testEditors.isEmpty && fileRevision(keysURL) != keysBefore, "Return with no open field is Done and saves")
 
 if failures > 0 { exit(1) }
 print("All regression checks passed")
