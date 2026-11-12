@@ -405,6 +405,37 @@ if waitUntil("batch OCR started", { reverseGate.count == 1 }) {
         check(reverseIndex.text(for: raceURL) == "replacement", "late batch completion cannot overwrite replacement OCR")
     }
 }
+// One editor save reindexes twice (the save path, then the thumbnail's file watcher).
+let dedupeDir = root.appendingPathComponent("dedupe", isDirectory: true)
+try FileManager.default.createDirectory(at: dedupeDir, withIntermediateDirectories: true)
+let dedupeURL = dedupeDir.appendingPathComponent("dedupe.png")
+try red.write(to: dedupeURL)
+let dedupeGate = OCRGate()
+let dedupeIndex = CaptureIndex(directory: dedupeDir, recognize: dedupeGate.recognize)
+dedupeIndex.indexFile(dedupeURL)
+if waitUntil("dedupe fixture starts its first OCR", { dedupeGate.count == 1 }) {
+    dedupeGate.finish(0, text: "before edit")
+    waitUntil("dedupe fixture stores its first text", { dedupeIndex.text(for: dedupeURL) == "before edit" })
+    let mode = (try FileManager.default.attributesOfItem(atPath: dedupeDir.appendingPathComponent(".ocr-index.json").path)[.posixPermissions] as? NSNumber)?.intValue
+    check(mode == 0o600, "OCR index file is written owner-only (0600)")
+    try CaptureFiles.save(blue, to: dedupeURL)
+    try dedupeIndex.reindex(dedupeURL)
+    check(dedupeIndex.text(for: dedupeURL) == nil, "first reindex after a save still drops the old text immediately")
+    try dedupeIndex.reindex(dedupeURL)
+    waitUntil("saved pixels start OCR", { dedupeGate.count == 2 })
+    drain()
+    check(dedupeGate.count == 2, "one save reindexed twice runs the recognizer exactly once")
+    try CaptureFiles.save(red, to: dedupeURL)
+    try dedupeIndex.reindex(dedupeURL)
+    if waitUntil("a further change restarts OCR", { dedupeGate.count == 3 }) {
+        dedupeGate.finish(1, text: "stale pixels")
+        drain()
+        check(dedupeIndex.text(for: dedupeURL) == nil, "superseded OCR cannot write text for older pixels")
+        dedupeGate.finish(2, text: "after edit")
+        waitUntil("restarted OCR stores the latest text", { dedupeIndex.text(for: dedupeURL) == "after edit" })
+    }
+}
+
 let reopened = CaptureIndex(directory: raceDir, recognize: { _ in nil })
 check(reopened.text(for: raceURL) == "replacement", "versioned cache reopens when file identity matches")
 try CaptureFiles.save(red, to: raceURL)

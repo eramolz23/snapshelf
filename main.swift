@@ -33,6 +33,8 @@ private let saveDir: URL = {
     let d = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("SnapShelf")
     try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+    // Owner-only, best-effort: captures and the OCR index can hold private text.
+    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: d.path)
     return d
 }()
 
@@ -124,6 +126,9 @@ final class CaptureIndex {
     private var entries: [String: Entry] = [:]
     private var generations: [String: Int] = [:]
     private var pending: [String: Int] = [:]
+    // File revision each pending OCR is reading, so a repeat reindex for the same pixels
+    // (editor save, then the thumbnail's file watcher) does not start a second OCR.
+    private var pendingRevisions: [String: String] = [:]
     private var changeNotificationPending = false
     var onChange: (() -> Void)?
     var onError: ((Error) -> Void)?
@@ -154,6 +159,7 @@ final class CaptureIndex {
         let generation = generations[name, default: 0]
         guard pending[name] != generation else { return }
         pending[name] = generation
+        pendingRevisions[name] = revision
         notifyChange()
         let recognize = self.recognize
         workerQueue.addOperation { [weak self] in
@@ -161,6 +167,7 @@ final class CaptureIndex {
             DispatchQueue.main.async {
                 guard let self, self.generations[name, default: 0] == generation else { return }
                 self.pending[name] = nil
+                self.pendingRevisions[name] = nil
                 guard fileRevision(url) == revision else {
                     do { try self.reindex(url) }
                     catch { self.report(error) }
@@ -179,11 +186,19 @@ final class CaptureIndex {
         generations[name, default: 0] += 1
         entries[name] = nil
         pending[name] = nil
+        pendingRevisions[name] = nil
         notifyChange()
         try save()
     }
 
-    func reindex(_ url: URL) throws { try invalidate(url); indexFile(url) }
+    func reindex(_ url: URL) throws {
+        // Nothing stored to drop and OCR already reading these exact pixels: no-op.
+        let name = url.lastPathComponent
+        if entries[name] == nil, pending[name] != nil,
+           let revision = pendingRevisions[name], revision == fileRevision(url) { return }
+        try invalidate(url)
+        indexFile(url)
+    }
 
     func prune() throws {
         let names = Set(entries.keys).union(pending.keys)
@@ -223,6 +238,8 @@ final class CaptureIndex {
         do {
             let data = try JSONEncoder().encode(Cache(version: 2, entries: entries))
             try data.write(to: indexURL, options: .atomic)
+            // OCR text is private: owner-only, best-effort (never fails the save).
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: indexURL.path)
         } catch {
             // This file is rebuildable. A failed rewrite must not leave text from the
             // previous image on disk after the edited PNG has already been saved.
@@ -620,8 +637,7 @@ final class EditorCanvas: NSView {
     private func pixelTile(for r: NSRect) -> NSImage? {
         // Sample visible edits as well as the original image. Sampling the original
         // could bring a secret back when Blur is applied over an existing redaction.
-        guard let data = renderPNG(), let rendered = NSImage(data: data),
-              let cg = rendered.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        guard let cg = renderBitmap()?.cgImage else { return nil }
         let s = CGFloat(cg.width) / max(image.size.width, 1)
         let px = CGRect(x: r.minX * s, y: (image.size.height - r.maxY) * s,
                         width: r.width * s, height: r.height * s).integral
@@ -645,7 +661,9 @@ final class EditorCanvas: NSView {
     }
 
     // Render image + annotations at full pixel resolution.
-    func renderPNG() -> Data? {
+    func renderPNG() -> Data? { renderBitmap()?.representation(using: .png, properties: [:]) }
+
+    func renderBitmap() -> NSBitmapImageRep? {
         guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
               let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: cg.width, pixelsHigh: cg.height,
                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
@@ -661,7 +679,7 @@ final class EditorCanvas: NSView {
         for m in marks { m.a.draw(lineWidth: m.width) }
         ctx.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()
-        return rep.representation(using: .png, properties: [:])
+        return rep
     }
 }
 
