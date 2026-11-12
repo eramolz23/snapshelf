@@ -8,7 +8,10 @@ swiftc -O -swift-version 5 main.swift -o SnapShelf
 
 APP="$HOME/Applications/SnapShelf.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp SnapShelf "$APP/Contents/MacOS/SnapShelf"
+# Copy beside the old binary, then rename over it: a running SnapShelf keeps its
+# (now unlinked) file instead of having its executable rewritten underneath it.
+cp SnapShelf "$APP/Contents/MacOS/SnapShelf.new"
+mv -f "$APP/Contents/MacOS/SnapShelf.new" "$APP/Contents/MacOS/SnapShelf"
 cp Info.plist "$APP/Contents/Info.plist"
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$APP"

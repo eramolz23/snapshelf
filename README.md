@@ -20,13 +20,18 @@ Single Swift file, no dependencies, no Apple Developer account needed.
 - **Click** a thumbnail → big centered editor: pen, highlighter, arrow, box, text,
   blur/pixelate, solid black redaction, crop — with per-stroke width (S/M/L), color picker,
   and full undo (⌘Z). Each capture has one editor; dismissing thumbnails leaves edits open.
+  **Return** is Done and **Esc** is Cancel; closing with unsaved edits (Cancel, ⌘W, Quit,
+  Restart) asks before discarding them. In a text annotation, Return places the text and
+  Esc drops it, without closing the editor, and ⌘X/⌘C/⌘V/⌘A work as usual.
 - **OCR** icon — on-device text recognition straight to the clipboard
-- **Link** icon — uploads to [litterbox](https://litterbox.catbox.moe) and copies a
-  share URL (public link, 72-hour expiry — use **Redact**, then **Done**, for secrets;
-  Blur is cosmetic pixelation)
+- **Link** icon — click once to arm it, click again within 4 seconds to upload to
+  [litterbox](https://litterbox.catbox.moe) and copy a share URL (public link, 72-hour
+  expiry — use **Redact**, then **Done**, for secrets; Blur is cosmetic pixelation)
 - **History** window — searchable grid of every capture, including search by the
   *text inside* the screenshots (background OCR index)
-- Captures persist in `~/Pictures/SnapShelf/` (auto-cleaned after 60 days)
+- Captures persist in `~/Pictures/SnapShelf/` (auto-cleaned after 60 days, checked at
+  launch and daily)
+- If a shortcut is taken by another app, its menu item says "shortcut unavailable"
 - Start at Login remembers your choice; the first upgrade preserves the macOS setting.
   Restart menu item.
 
@@ -44,7 +49,9 @@ open ~/Applications/SnapShelf.app
 ```
 
 Grant **Screen Recording** permission when prompted on first capture
-(System Settings → Privacy & Security → Screen Recording).
+(System Settings → Privacy & Security → Screen Recording). If a capture fails because
+the permission is missing, SnapShelf explains this and offers to open that pane; turn
+SnapShelf on there, then use Restart SnapShelf.
 
 Note: the build is ad-hoc signed, so every rebuild invalidates that permission —
 `build.sh` resets it automatically and macOS will re-prompt once.
