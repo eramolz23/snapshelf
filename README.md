@@ -59,7 +59,8 @@ Note: the build is ad-hoc signed, so every rebuild invalidates that permission â
 ## Installing a prebuilt zip (no Xcode)
 
 If you downloaded `SnapShelf-x.y.z.zip` (e.g. from a GitHub release): unzip and move
-`SnapShelf.app` to `~/Applications`. The app isn't notarized (no Apple Developer
+`SnapShelf.app` to `~/Applications`. Releases from 1.0.3 on are universal (Apple
+Silicon and Intel) and need macOS 13 or later. The app isn't notarized (no Apple Developer
 account), so the first launch is blocked once:
 
 1. Double-click the app â€” macOS says it can't be opened.
